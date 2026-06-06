@@ -61,24 +61,13 @@ impl Application {
         }
     }
 
-    fn start_pty(&mut self) -> Result<(), AppError> {
+    fn start_pty(&mut self, pixel_width: u32, pixel_height: u32) -> Result<(), AppError> {
         if self.pty.is_some() {
             return Ok(());
         }
 
-        let metrics = self
-            .window_state
-            .as_ref()
-            .map(|state| state.renderer.cell_metrics())
-            .unwrap_or(self.renderer_config.cell_metrics);
-        let initial_cols = self.config.initial_cols();
-        let initial_rows = self.config.initial_rows();
-        let size = PtySize {
-            rows: initial_rows as u16,
-            cols: initial_cols as u16,
-            pixel_width: (initial_cols as u32 * metrics.width).min(u16::MAX as u32) as u16,
-            pixel_height: (initial_rows as u32 * metrics.height).min(u16::MAX as u32) as u16,
-        };
+        let (cols, rows) = self.terminal.size();
+        let size = pty_size_for_terminal(cols, rows, pixel_width, pixel_height);
         let mut pty = PtySession::spawn_default_shell(size)?;
         let reader = pty.take_reader()?;
         let writer = Arc::new(Mutex::new(pty.take_writer()?));
@@ -111,12 +100,7 @@ impl Application {
         self.terminal.resize(cols, rows);
 
         if let Some(pty) = &mut self.pty {
-            let _ = pty.resize(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: width.min(u16::MAX as u32) as u16,
-                pixel_height: height.min(u16::MAX as u32) as u16,
-            });
+            let _ = pty.resize(pty_size_for_terminal(cols, rows, width, height));
         }
     }
 }
@@ -180,7 +164,8 @@ impl ApplicationHandler<UserEvent> for Application {
         };
 
         self.resize_terminal(size.width, size.height);
-        self.start_pty().expect("spawn default shell");
+        self.start_pty(size.width, size.height)
+            .expect("spawn default shell");
         self.window_state = Some(WindowState {
             window: window.clone(),
             renderer,
@@ -336,6 +321,23 @@ fn spawn_pty_reader(mut reader: Box<dyn Read + Send>, proxy: EventLoopProxy<User
     });
 }
 
+fn pty_size_for_terminal(cols: usize, rows: usize, pixel_width: u32, pixel_height: u32) -> PtySize {
+    PtySize {
+        rows: clamp_pty_cells(rows),
+        cols: clamp_pty_cells(cols),
+        pixel_width: clamp_pty_pixels(pixel_width),
+        pixel_height: clamp_pty_pixels(pixel_height),
+    }
+}
+
+fn clamp_pty_cells(value: usize) -> u16 {
+    value.clamp(1, u16::MAX as usize) as u16
+}
+
+fn clamp_pty_pixels(value: u32) -> u16 {
+    value.min(u16::MAX as u32) as u16
+}
+
 fn selected_wgpu_backends(config_value: Option<&str>) -> Result<Backends, AppError> {
     let value = std::env::var("KNIGHTTY_WGPU_BACKEND")
         .ok()
@@ -364,4 +366,29 @@ enum AppError {
     Config(#[from] config::ConfigError),
     #[error("invalid wgpu backend `{0}`; expected auto, vulkan, dx12, or gl")]
     InvalidWgpuBackend(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pty_size_for_terminal;
+
+    #[test]
+    fn pty_size_uses_live_terminal_grid_and_window_pixels() {
+        let size = pty_size_for_terminal(132, 43, 1920, 1080);
+
+        assert_eq!(size.cols, 132);
+        assert_eq!(size.rows, 43);
+        assert_eq!(size.pixel_width, 1920);
+        assert_eq!(size.pixel_height, 1080);
+    }
+
+    #[test]
+    fn pty_size_clamps_zero_cells_and_large_pixels() {
+        let size = pty_size_for_terminal(0, usize::MAX, u32::MAX, 70_000);
+
+        assert_eq!(size.cols, 1);
+        assert_eq!(size.rows, u16::MAX);
+        assert_eq!(size.pixel_width, u16::MAX);
+        assert_eq!(size.pixel_height, u16::MAX);
+    }
 }

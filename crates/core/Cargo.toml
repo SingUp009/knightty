@@ -1,0 +1,16 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[lib]
+name = "knightty_core"
+path = "src/lib.rs"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+thiserror = "2.0.18"
+unicode-width = "0.2.2"
+vte = "0.15.0"

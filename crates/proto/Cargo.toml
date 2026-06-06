@@ -1,0 +1,13 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[lib]
+name = "knightty_proto"
+path = "src/lib.rs"
+
+[dependencies]
+knightty_core = { package = "core", version = "0.1.0", path = "../core" }

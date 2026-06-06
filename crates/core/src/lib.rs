@@ -27,6 +27,7 @@ pub struct Terminal {
     processor: Processor,
     damage: Damage,
     pty_writes: Arc<Mutex<Vec<String>>>,
+    pending_compat_input: Vec<u8>,
 }
 
 impl Terminal {
@@ -53,6 +54,7 @@ impl Terminal {
             processor: Processor::new(),
             damage: Damage::Full,
             pty_writes,
+            pending_compat_input: Vec::new(),
         }
     }
 
@@ -62,6 +64,12 @@ impl Terminal {
         self.term.resize(size);
         self.damage = Damage::Full;
         self.term.reset_damage();
+    }
+
+    /// Return the current visible grid size as `(cols, rows)`.
+    pub fn size(&self) -> (usize, usize) {
+        let grid = self.term.grid();
+        (grid.columns(), grid.screen_lines())
     }
 
     /// Feed PTY bytes into the VT state machine.
@@ -79,9 +87,60 @@ impl Terminal {
             return;
         }
 
-        self.processor.advance(&mut self.term, bytes);
+        let mut input = core::mem::take(&mut self.pending_compat_input);
+        input.extend_from_slice(bytes);
+
+        let pending_start = self.process_compat_input(&input);
+        if pending_start < input.len() {
+            self.pending_compat_input
+                .extend_from_slice(&input[pending_start..]);
+        }
+
         let damage = self.collect_damage();
         self.damage = merge_damage(core::mem::replace(&mut self.damage, Damage::None), damage);
+    }
+
+    /// Return whether bracketed paste mode is currently enabled.
+    ///
+    /// ```
+    /// use knightty_core::Terminal;
+    ///
+    /// let mut term = Terminal::new(80, 24);
+    /// assert!(!term.bracketed_paste_enabled());
+    ///
+    /// term.feed(b"\x1b[?2004h");
+    /// assert!(term.bracketed_paste_enabled());
+    /// ```
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Wrap pasted bytes when bracketed paste mode is enabled.
+    ///
+    /// ```
+    /// use knightty_core::Terminal;
+    ///
+    /// let mut term = Terminal::new(80, 24);
+    /// assert_eq!(term.paste_bytes(b"hello"), b"hello");
+    ///
+    /// term.feed(b"\x1b[?2004h");
+    /// assert_eq!(
+    ///     term.paste_bytes(b"hello"),
+    ///     b"\x1b[200~hello\x1b[201~",
+    /// );
+    /// ```
+    pub fn paste_bytes(&self, bytes: &[u8]) -> Vec<u8> {
+        if !self.bracketed_paste_enabled() {
+            return bytes.to_vec();
+        }
+
+        let mut wrapped = Vec::with_capacity(
+            bytes.len() + BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len(),
+        );
+        wrapped.extend_from_slice(BRACKETED_PASTE_START);
+        wrapped.extend_from_slice(bytes);
+        wrapped.extend_from_slice(BRACKETED_PASTE_END);
+        wrapped
     }
 
     /// Return a render-safe copy of the visible grid.
@@ -162,6 +221,134 @@ impl Terminal {
         self.term.reset_damage();
         damage
     }
+
+    fn process_compat_input(&mut self, input: &[u8]) -> usize {
+        let mut chunk_start = 0;
+        let mut cursor = 0;
+
+        while cursor < input.len() {
+            match scan_csi(input, cursor) {
+                CsiScan::NotCsi => cursor += 1,
+                CsiScan::Incomplete => break,
+                CsiScan::Complete { end, action } => {
+                    if let Some(action) = action {
+                        self.advance_processor(&input[chunk_start..cursor]);
+                        self.apply_compat_action(action);
+                        cursor = end + 1;
+                        chunk_start = cursor;
+                    } else {
+                        cursor = end + 1;
+                    }
+                }
+            }
+        }
+
+        self.advance_processor(&input[chunk_start..cursor]);
+        cursor
+    }
+
+    fn advance_processor(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.processor.advance(&mut self.term, bytes);
+        }
+    }
+
+    fn apply_compat_action(&mut self, action: CompatAction) {
+        match action {
+            CompatAction::SetAltScreen => {
+                if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                    self.term.swap_alt();
+                }
+            }
+            CompatAction::ResetAltScreen => {
+                if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                    self.term.swap_alt();
+                }
+            }
+            CompatAction::SaveCursor => self.processor.advance(&mut self.term, b"\x1b7"),
+            CompatAction::RestoreCursor => self.processor.advance(&mut self.term, b"\x1b8"),
+        }
+    }
+}
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+const ESC: u8 = 0x1b;
+const CSI: u8 = 0x9b;
+const MAX_COMPAT_CSI_LEN: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatAction {
+    SetAltScreen,
+    ResetAltScreen,
+    SaveCursor,
+    RestoreCursor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CsiScan {
+    NotCsi,
+    Incomplete,
+    Complete {
+        end: usize,
+        action: Option<CompatAction>,
+    },
+}
+
+fn scan_csi(input: &[u8], start: usize) -> CsiScan {
+    let Some(&first) = input.get(start) else {
+        return CsiScan::NotCsi;
+    };
+
+    let body_start = match first {
+        ESC => match input.get(start + 1) {
+            Some(b'[') => start + 2,
+            Some(_) => return CsiScan::NotCsi,
+            None => return CsiScan::Incomplete,
+        },
+        CSI => start + 1,
+        _ => return CsiScan::NotCsi,
+    };
+
+    for index in body_start..input.len() {
+        let byte = input[index];
+        if (0x40..=0x7e).contains(&byte) {
+            return CsiScan::Complete {
+                end: index,
+                action: compat_action(&input[body_start..index], byte),
+            };
+        }
+    }
+
+    if input.len().saturating_sub(start) > MAX_COMPAT_CSI_LEN {
+        CsiScan::NotCsi
+    } else {
+        CsiScan::Incomplete
+    }
+}
+
+fn compat_action(params: &[u8], final_byte: u8) -> Option<CompatAction> {
+    if final_byte != b'h' && final_byte != b'l' {
+        return None;
+    }
+
+    let mode = params.strip_prefix(b"?").and_then(parse_private_mode)?;
+    match (mode, final_byte) {
+        (1047, b'h') => Some(CompatAction::SetAltScreen),
+        (1047, b'l') => Some(CompatAction::ResetAltScreen),
+        (1048, b'h') => Some(CompatAction::SaveCursor),
+        (1048, b'l') => Some(CompatAction::RestoreCursor),
+        _ => None,
+    }
+}
+
+fn parse_private_mode(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    core::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 #[derive(Clone)]
@@ -510,5 +697,192 @@ mod tests {
         term.feed(b"\x1b[?25l");
 
         assert!(!term.snapshot().cursor.visible);
+    }
+
+    #[test]
+    fn dec_1049_alt_screen_preserves_and_restores_primary_screen() {
+        let mut term = Terminal::new(10, 3);
+
+        term.feed(b"primary");
+        term.feed(b"\x1b[?1049h");
+        term.feed(b"\x1b[H");
+        term.feed(b"alt");
+
+        assert_eq!(term.snapshot().cell(0, 0).ch, 'a');
+
+        term.feed(b"\x1b[?1049l");
+        let grid = term.snapshot();
+        assert_eq!(grid.cell(0, 0).ch, 'p');
+        assert_eq!(grid.cell(1, 0).ch, 'r');
+        assert_eq!(grid.cell(2, 0).ch, 'i');
+    }
+
+    #[test]
+    fn dec_1047_alt_screen_preserves_and_restores_primary_screen() {
+        let mut term = Terminal::new(10, 3);
+
+        term.feed(b"primary");
+        term.feed(b"\x1b[?1047h");
+        term.feed(b"\x1b[H");
+        term.feed(b"alt");
+
+        assert_eq!(term.snapshot().cell(0, 0).ch, 'a');
+
+        term.feed(b"\x1b[?1047l");
+        let grid = term.snapshot();
+        assert_eq!(grid.cell(0, 0).ch, 'p');
+        assert_eq!(grid.cell(1, 0).ch, 'r');
+        assert_eq!(grid.cell(2, 0).ch, 'i');
+    }
+
+    #[test]
+    fn dec_1048_saves_and_restores_cursor_position() {
+        let mut term = Terminal::new(10, 5);
+
+        term.feed(b"\x1b[2;3H");
+        term.feed(b"\x1b[?1048h");
+        term.feed(b"\x1b[4;5H");
+        assert_eq!(term.snapshot().cursor.x, 4);
+        assert_eq!(term.snapshot().cursor.y, 3);
+
+        term.feed(b"\x1b[?1048l");
+        let cursor = term.snapshot().cursor;
+        assert_eq!(cursor.x, 2);
+        assert_eq!(cursor.y, 1);
+    }
+
+    #[test]
+    fn dec_1048_split_across_feeds_still_restores_cursor_position() {
+        let mut term = Terminal::new(10, 5);
+
+        term.feed(b"\x1b[2;3H");
+        term.feed(b"\x1b[?1048h");
+        term.feed(b"\x1b[4;5H");
+        term.feed(b"\x1b[?104");
+        term.feed(b"8l");
+
+        let cursor = term.snapshot().cursor;
+        assert_eq!(cursor.x, 2);
+        assert_eq!(cursor.y, 1);
+    }
+
+    #[test]
+    fn decstbm_scrolls_only_inside_scroll_region() {
+        let mut term = Terminal::new(5, 4);
+
+        term.feed(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD");
+        term.feed(b"\x1b[2;3r\x1b[3;1H\n");
+
+        let grid = term.snapshot();
+        assert_eq!(grid.cell(0, 0).ch, 'A');
+        assert_eq!(grid.cell(0, 1).ch, 'C');
+        assert_eq!(grid.cell(0, 2).ch, ' ');
+        assert_eq!(grid.cell(0, 3).ch, 'D');
+    }
+
+    #[test]
+    fn origin_mode_addresses_cursor_relative_to_scroll_region() {
+        let mut term = Terminal::new(5, 5);
+
+        term.feed(b"\x1b[2;4r\x1b[?6h\x1b[1;1HX");
+        assert_eq!(term.snapshot().cell(0, 1).ch, 'X');
+
+        term.feed(b"\x1b[?6l\x1b[1;1HY");
+        assert_eq!(term.snapshot().cell(0, 0).ch, 'Y');
+    }
+
+    #[test]
+    fn delete_line_is_limited_to_scroll_region() {
+        let mut term = Terminal::new(5, 5);
+
+        term.feed(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE");
+        term.feed(b"\x1b[2;4r\x1b[2;1H\x1b[1M");
+
+        let grid = term.snapshot();
+        assert_eq!(grid.cell(0, 0).ch, 'A');
+        assert_eq!(grid.cell(0, 1).ch, 'C');
+        assert_eq!(grid.cell(0, 2).ch, 'D');
+        assert_eq!(grid.cell(0, 3).ch, ' ');
+        assert_eq!(grid.cell(0, 4).ch, 'E');
+    }
+
+    #[test]
+    fn insert_line_is_limited_to_scroll_region() {
+        let mut term = Terminal::new(5, 5);
+
+        term.feed(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE");
+        term.feed(b"\x1b[2;4r\x1b[3;1H\x1b[1L");
+
+        let grid = term.snapshot();
+        assert_eq!(grid.cell(0, 0).ch, 'A');
+        assert_eq!(grid.cell(0, 1).ch, 'B');
+        assert_eq!(grid.cell(0, 2).ch, ' ');
+        assert_eq!(grid.cell(0, 3).ch, 'C');
+        assert_eq!(grid.cell(0, 4).ch, 'E');
+    }
+
+    #[test]
+    fn insert_and_delete_character_affect_only_current_line() {
+        let mut term = Terminal::new(5, 2);
+
+        term.feed(b"abcde\x1b[2;1Hvwxyz\x1b[1;3H\x1b[2@");
+        let grid = term.snapshot();
+        assert_eq!(line_text(&grid, 0), "ab  c");
+        assert_eq!(line_text(&grid, 1), "vwxyz");
+
+        term.feed(b"\x1b[2;2H\x1b[2P");
+        let grid = term.snapshot();
+        assert_eq!(line_text(&grid, 1), "vyz  ");
+    }
+
+    #[test]
+    fn insert_character_preserves_wide_cell_pairing() {
+        let mut term = Terminal::new(6, 1);
+
+        term.feed("A界BC".as_bytes());
+        term.feed(b"\x1b[1;2H\x1b[1@");
+
+        let grid = term.snapshot();
+        let wide_column = (0..grid.cols)
+            .find(|column| grid.cell(*column, 0).flags.wide)
+            .expect("wide cell should remain visible");
+        assert!(grid.cell(wide_column + 1, 0).flags.wide_spacer);
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_payload_only_when_mode_is_enabled() {
+        let mut term = Terminal::new(10, 3);
+
+        assert!(!term.bracketed_paste_enabled());
+        assert_eq!(term.paste_bytes(b"hello"), b"hello");
+
+        term.feed(b"\x1b[?2004h");
+        assert!(term.bracketed_paste_enabled());
+        assert_eq!(term.paste_bytes(b"hello"), b"\x1b[200~hello\x1b[201~");
+
+        term.feed(b"\x1b[?2004l");
+        assert!(!term.bracketed_paste_enabled());
+        assert_eq!(term.paste_bytes(b"hello"), b"hello");
+    }
+
+    #[test]
+    fn resize_clamps_cursor_to_visible_grid_and_reports_full_damage() {
+        let mut term = Terminal::new(5, 5);
+
+        term.take_damage();
+        term.feed(b"\x1b[5;5H");
+        term.take_damage();
+        term.resize(2, 2);
+
+        let grid = term.snapshot();
+        assert!(grid.cursor.x < grid.cols);
+        assert!(grid.cursor.y < grid.rows);
+        assert_eq!(term.take_damage(), Damage::Full);
+    }
+
+    fn line_text(grid: &super::GridSnapshot, row: usize) -> String {
+        (0..grid.cols)
+            .map(|column| grid.cell(column, row).ch)
+            .collect()
     }
 }

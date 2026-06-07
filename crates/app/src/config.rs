@@ -4,12 +4,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use knightty_pty::ShellCommand;
 use knightty_render::{CellMetrics, RendererConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 const DEFAULT_INITIAL_COLS: usize = 80;
 const DEFAULT_INITIAL_ROWS: usize = 24;
+const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+const DEFAULT_SCROLL_MULTIPLIER: usize = 3;
+const MAX_SCROLLBACK_LINES: usize = 100_000;
+const MAX_SCROLL_MULTIPLIER: usize = 100;
+const DEFAULT_HYPERLINK_ALLOWED_SCHEMES: &[&str] = &["https", "http"];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -17,6 +23,9 @@ pub struct AppConfig {
     pub font: FontConfig,
     pub window: WindowConfig,
     pub render: RenderConfig,
+    pub terminal: TerminalConfig,
+    pub shell: ShellConfig,
+    pub hyperlink: HyperlinkConfig,
 }
 
 impl AppConfig {
@@ -30,6 +39,18 @@ impl AppConfig {
 
     pub fn wgpu_backend(&self) -> Option<&str> {
         self.render.wgpu_backend.as_deref()
+    }
+
+    pub fn scrollback_lines(&self) -> usize {
+        self.terminal
+            .scrollback_lines
+            .unwrap_or(DEFAULT_SCROLLBACK_LINES)
+    }
+
+    pub fn scroll_multiplier(&self) -> usize {
+        self.terminal
+            .scroll_multiplier
+            .unwrap_or(DEFAULT_SCROLL_MULTIPLIER)
     }
 
     pub fn renderer_config(&self) -> RendererConfig {
@@ -46,19 +67,57 @@ impl AppConfig {
         }
     }
 
+    pub fn shell_command(&self) -> Option<ShellCommand> {
+        self.shell.program.as_ref().map(|program| ShellCommand {
+            program: program.clone(),
+            args: self.shell.args.clone(),
+        })
+    }
+
+    pub fn hyperlink_open_on_ctrl_click(&self) -> bool {
+        self.hyperlink.open_on_ctrl_click
+    }
+
+    pub fn hyperlink_allowed_schemes(&self) -> &[String] {
+        &self.hyperlink.allowed_schemes
+    }
+
+    pub fn hyperlink_underline_on_hover(&self) -> bool {
+        self.hyperlink.underline_on_hover
+    }
+
+    pub fn hyperlink_open_enabled(&self) -> bool {
+        self.hyperlink_open_on_ctrl_click() && !self.hyperlink.allowed_schemes.is_empty()
+    }
+
     fn validate(&self, source: Option<&Path>) -> Result<(), ConfigError> {
         validate_positive_float("font.size", self.font.size, source)?;
         validate_positive_float("font.line_height", self.font.line_height, source)?;
         validate_positive_usize("window.initial_cols", self.window.initial_cols, source)?;
         validate_positive_usize("window.initial_rows", self.window.initial_rows, source)?;
-        if let Some(value) = &self.render.wgpu_backend {
-            if parse_wgpu_backend_name(value).is_none() {
-                return Err(ConfigError::InvalidValue {
-                    path: source.map(Path::to_path_buf),
-                    field: "render.wgpu_backend",
-                    message: format!("expected one of auto, vulkan, dx12, or gl, got `{value}`"),
-                });
-            }
+        validate_non_empty_string("shell.program", self.shell.program.as_deref(), source)?;
+        validate_usize_range(
+            "terminal.scrollback_lines",
+            self.terminal.scrollback_lines,
+            0,
+            MAX_SCROLLBACK_LINES,
+            source,
+        )?;
+        validate_usize_range(
+            "terminal.scroll_multiplier",
+            self.terminal.scroll_multiplier,
+            1,
+            MAX_SCROLL_MULTIPLIER,
+            source,
+        )?;
+        if let Some(value) = &self.render.wgpu_backend
+            && parse_wgpu_backend_name(value).is_none()
+        {
+            return Err(ConfigError::InvalidValue {
+                path: source.map(Path::to_path_buf),
+                field: "render.wgpu_backend",
+                message: format!("expected one of auto, vulkan, dx12, or gl, got `{value}`"),
+            });
         }
         Ok(())
     }
@@ -83,6 +142,61 @@ pub struct WindowConfig {
 #[serde(default)]
 pub struct RenderConfig {
     pub wgpu_backend: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TerminalConfig {
+    pub scrollback_lines: Option<usize>,
+    pub scroll_multiplier: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ShellConfig {
+    pub program: Option<String>,
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HyperlinkConfig {
+    pub open_on_ctrl_click: bool,
+    #[serde(
+        default = "default_hyperlink_allowed_schemes",
+        deserialize_with = "deserialize_lowercase_schemes"
+    )]
+    pub allowed_schemes: Vec<String>,
+    pub underline_on_hover: bool,
+}
+
+impl Default for HyperlinkConfig {
+    fn default() -> Self {
+        Self {
+            open_on_ctrl_click: true,
+            allowed_schemes: default_hyperlink_allowed_schemes(),
+            underline_on_hover: true,
+        }
+    }
+}
+
+fn default_hyperlink_allowed_schemes() -> Vec<String> {
+    DEFAULT_HYPERLINK_ALLOWED_SCHEMES
+        .iter()
+        .map(|scheme| (*scheme).to_owned())
+        .collect()
+}
+
+fn deserialize_lowercase_schemes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(|schemes| {
+        schemes
+            .into_iter()
+            .map(|scheme| scheme.to_ascii_lowercase())
+            .collect()
+    })
 }
 
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
@@ -173,14 +287,14 @@ fn validate_positive_float(
     value: Option<f32>,
     source: Option<&Path>,
 ) -> Result<(), ConfigError> {
-    if let Some(value) = value {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(ConfigError::InvalidValue {
-                path: source.map(Path::to_path_buf),
-                field,
-                message: format!("expected a positive number, got `{value}`"),
-            });
-        }
+    if let Some(value) = value
+        && (!value.is_finite() || value <= 0.0)
+    {
+        return Err(ConfigError::InvalidValue {
+            path: source.map(Path::to_path_buf),
+            field,
+            message: format!("expected a positive number, got `{value}`"),
+        });
     }
     Ok(())
 }
@@ -195,6 +309,40 @@ fn validate_positive_usize(
             path: source.map(Path::to_path_buf),
             field,
             message: "expected a positive integer, got `0`".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_non_empty_string(
+    field: &'static str,
+    value: Option<&str>,
+    source: Option<&Path>,
+) -> Result<(), ConfigError> {
+    if matches!(value, Some(value) if value.is_empty()) {
+        return Err(ConfigError::InvalidValue {
+            path: source.map(Path::to_path_buf),
+            field,
+            message: "expected a non-empty string".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_usize_range(
+    field: &'static str,
+    value: Option<usize>,
+    min: usize,
+    max: usize,
+    source: Option<&Path>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = value
+        && !(min..=max).contains(&value)
+    {
+        return Err(ConfigError::InvalidValue {
+            path: source.map(Path::to_path_buf),
+            field,
+            message: format!("expected an integer from {min} to {max}, got `{value}`"),
         });
     }
     Ok(())
@@ -240,6 +388,15 @@ mod tests {
         assert_eq!(config.initial_rows(), 24);
         assert_eq!(config.renderer_config().cell_metrics.font_size, 16.0);
         assert_eq!(config.renderer_config().font_family, None);
+        assert_eq!(config.scrollback_lines(), 10_000);
+        assert_eq!(config.scroll_multiplier(), 3);
+        assert!(config.hyperlink_open_on_ctrl_click());
+        assert_eq!(
+            config.hyperlink_allowed_schemes(),
+            &["https".to_owned(), "http".to_owned()]
+        );
+        assert!(config.hyperlink_underline_on_hover());
+        assert!(config.hyperlink_open_enabled());
     }
 
     #[test]
@@ -280,7 +437,8 @@ mod tests {
         let path = dir.join("config.json");
         fs::write(&path, "{not json").expect("write invalid config");
 
-        let error = load_app_config_from_paths(&[path.clone()]).expect_err("invalid JSON errors");
+        let error = load_app_config_from_paths(std::slice::from_ref(&path))
+            .expect_err("invalid JSON errors");
 
         assert!(matches!(error, ConfigError::Parse { path: error_path, .. } if error_path == path));
     }
@@ -301,6 +459,115 @@ mod tests {
         assert_eq!(renderer_config.cell_metrics.font_size, 18.0);
         assert_eq!(renderer_config.cell_metrics.line_height, 22.0);
         assert_eq!(renderer_config.cell_metrics.height, 22);
+    }
+
+    #[test]
+    fn terminal_settings_are_loaded() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"terminal":{"scrollback_lines":2000,"scroll_multiplier":5}}"#)
+                .expect("parse config");
+
+        assert_eq!(config.scrollback_lines(), 2000);
+        assert_eq!(config.scroll_multiplier(), 5);
+    }
+
+    #[test]
+    fn hyperlink_allowed_schemes_are_lowercase_normalized() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"hyperlink":{"allowed_schemes":["HTTPS","Http"]}}"#)
+                .expect("parse config");
+
+        assert_eq!(
+            config.hyperlink_allowed_schemes(),
+            &["https".to_owned(), "http".to_owned()]
+        );
+    }
+
+    #[test]
+    fn empty_hyperlink_allowed_schemes_disable_open() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"hyperlink":{"allowed_schemes":[]}}"#).expect("parse config");
+
+        assert!(config.hyperlink_open_on_ctrl_click());
+        assert!(config.hyperlink_allowed_schemes().is_empty());
+        assert!(!config.hyperlink_open_enabled());
+    }
+
+    #[test]
+    fn shell_settings_build_shell_command() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"shell":{"program":"pwsh","args":["-NoLogo"]}}"#)
+                .expect("parse config");
+
+        let shell = config.shell_command().expect("shell should be configured");
+
+        assert_eq!(shell.program, "pwsh");
+        assert_eq!(shell.args, vec!["-NoLogo"]);
+    }
+
+    #[test]
+    fn missing_shell_settings_use_default_shell() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.shell_command(), None);
+    }
+
+    #[test]
+    fn terminal_scrollback_lines_are_range_validated() {
+        let dir = temp_path("invalid-scrollback-lines");
+        fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"terminal":{"scrollback_lines":100001}}"#)
+            .expect("write invalid config");
+
+        let error = load_app_config_from_paths(std::slice::from_ref(&path))
+            .expect_err("invalid scrollback_lines errors");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                field: "terminal.scrollback_lines",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_scroll_multiplier_is_range_validated() {
+        let dir = temp_path("invalid-scroll-multiplier");
+        fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"terminal":{"scroll_multiplier":0}}"#).expect("write invalid config");
+
+        let error = load_app_config_from_paths(std::slice::from_ref(&path))
+            .expect_err("invalid scroll_multiplier errors");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                field: "terminal.scroll_multiplier",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_shell_program_is_invalid() {
+        let dir = temp_path("invalid-shell-program");
+        fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"shell":{"program":""}}"#).expect("write invalid config");
+
+        let error = load_app_config_from_paths(std::slice::from_ref(&path))
+            .expect_err("invalid shell program errors");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                field: "shell.program",
+                ..
+            }
+        ));
     }
 
     #[cfg(windows)]

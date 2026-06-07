@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use wgpu::{
 
 const DEFAULT_FG: Rgba = Rgba::rgb(230, 230, 230);
 const DEFAULT_BG: Rgba = Rgba::rgb(0, 0, 0);
+const DEFAULT_SELECTION_BG: Rgba = Rgba::rgb(38, 79, 120);
 
 /// Fixed terminal cell metrics used by the renderer and PTY resize path.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,25 +71,40 @@ impl CellMetrics {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RendererConfig {
     pub cell_metrics: CellMetrics,
     pub font_family: Option<String>,
 }
 
-impl Default for RendererConfig {
-    fn default() -> Self {
-        Self {
-            cell_metrics: CellMetrics::default(),
-            font_family: None,
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FontFamilyInfo {
+    pub name: String,
+    pub monospaced: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderPlan {
     pub text: Vec<TextSegmentPlan>,
     pub rects: Vec<RectPlan>,
+    pub selection_rects: Vec<RectPlan>,
+    pub hyperlink_spans: Vec<HyperlinkSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderOptions {
+    pub hovered_hyperlink_id: Option<usize>,
+}
+
+/// Contiguous visible cells associated with one hyperlink.
+///
+/// `end_col` is exclusive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HyperlinkSpan {
+    pub hyperlink_id: usize,
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,6 +166,28 @@ impl Rgba {
             f32::from(self.b) / 255.0,
             f32::from(self.a) / 255.0,
         ]
+    }
+
+    fn to_target_f32(self, target_is_srgb: bool) -> [f32; 4] {
+        if target_is_srgb {
+            [
+                srgb_channel_to_linear(self.r),
+                srgb_channel_to_linear(self.g),
+                srgb_channel_to_linear(self.b),
+                f32::from(self.a) / 255.0,
+            ]
+        } else {
+            self.to_f32()
+        }
+    }
+}
+
+fn srgb_channel_to_linear(value: u8) -> f32 {
+    let value = f32::from(value) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -303,8 +342,13 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render(&mut self, snapshot: &GridSnapshot, damage: &Damage) -> Result<(), RenderError> {
-        let plan = build_render_plan(snapshot, damage, self.cell_metrics);
+    pub fn render(
+        &mut self,
+        snapshot: &GridSnapshot,
+        damage: &Damage,
+        options: RenderOptions,
+    ) -> Result<(), RenderError> {
+        let plan = build_render_plan_with_options(snapshot, damage, self.cell_metrics, options);
         self.update_text(&plan);
 
         let background_rects = plan
@@ -313,6 +357,8 @@ impl Renderer {
             .copied()
             .filter(|rect| rect.layer == RectLayer::Background)
             .collect::<Vec<_>>();
+        let mut background_rects = background_rects;
+        background_rects.extend(plan.selection_rects.iter().copied());
         let overlay_rects = plan
             .rects
             .iter()
@@ -451,6 +497,41 @@ impl Renderer {
     }
 }
 
+pub fn available_font_families() -> Vec<FontFamilyInfo> {
+    let font_system = FontSystem::new();
+    font_families_from_system(&font_system)
+}
+
+fn font_families_from_system(font_system: &FontSystem) -> Vec<FontFamilyInfo> {
+    unique_font_family_infos(font_system.db().faces().flat_map(|face| {
+        face.families
+            .iter()
+            .map(move |(family, _language)| (family.as_str(), face.monospaced))
+    }))
+}
+
+fn unique_font_family_infos<'a>(
+    families: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Vec<FontFamilyInfo> {
+    let mut by_name = BTreeMap::new();
+    for (family, monospaced) in families {
+        let family = family.trim();
+        if family.is_empty() {
+            continue;
+        }
+
+        by_name
+            .entry(family.to_owned())
+            .and_modify(|existing| *existing |= monospaced)
+            .or_insert(monospaced);
+    }
+
+    by_name
+        .into_iter()
+        .map(|(name, monospaced)| FontFamilyInfo { name, monospaced })
+        .collect()
+}
+
 fn new_text_buffer(font_system: &mut FontSystem, cell_metrics: CellMetrics) -> Buffer {
     let mut buffer = Buffer::new(
         font_system,
@@ -477,13 +558,29 @@ pub fn build_render_plan(
     _damage: &Damage,
     metrics: CellMetrics,
 ) -> RenderPlan {
+    build_render_plan_with_options(snapshot, _damage, metrics, RenderOptions::default())
+}
+
+pub fn build_render_plan_with_options(
+    snapshot: &GridSnapshot,
+    _damage: &Damage,
+    metrics: CellMetrics,
+    options: RenderOptions,
+) -> RenderPlan {
     let mut text = Vec::new();
     let mut rects = Vec::new();
+    let mut selection_rects = Vec::new();
+    let mut hyperlink_spans = Vec::new();
 
     for (row_index, row) in snapshot.lines().enumerate() {
         push_background_rects(row, row_index, metrics, &mut rects);
         push_underline_rects(row, row_index, metrics, &mut rects);
         push_text_segments(row, row_index, metrics, &mut text);
+        push_hyperlink_spans(row, row_index, &mut hyperlink_spans);
+    }
+    push_selection_rects(snapshot, metrics, &mut selection_rects);
+    if let Some(hyperlink_id) = options.hovered_hyperlink_id {
+        push_hover_hyperlink_underline_rects(snapshot, hyperlink_id, metrics, &mut rects);
     }
 
     if snapshot.cursor.visible {
@@ -497,7 +594,65 @@ pub fn build_render_plan(
         });
     }
 
-    RenderPlan { text, rects }
+    RenderPlan {
+        text,
+        rects,
+        selection_rects,
+        hyperlink_spans,
+    }
+}
+
+fn push_hover_hyperlink_underline_rects(
+    snapshot: &GridSnapshot,
+    hyperlink_id: usize,
+    metrics: CellMetrics,
+    rects: &mut Vec<RectPlan>,
+) {
+    for (row_index, row) in snapshot.lines().enumerate() {
+        push_hyperlink_underline_rects(row, row_index, hyperlink_id, metrics, rects);
+    }
+}
+
+fn push_hyperlink_underline_rects(
+    row: &[Cell],
+    row_index: usize,
+    hyperlink_id: usize,
+    metrics: CellMetrics,
+    rects: &mut Vec<RectPlan>,
+) {
+    let mut start = None::<(usize, Rgba)>;
+
+    for (column, cell) in row.iter().enumerate() {
+        if cell.flags.wide_spacer || cell.hyperlink != Some(hyperlink_id) {
+            flush_underline_rect(start.take(), column, row_index, metrics, rects);
+            continue;
+        }
+
+        let fg = effective_fg(cell);
+        match start {
+            Some((_, color)) if color == fg => {}
+            Some(_) => {
+                flush_underline_rect(start.take(), column, row_index, metrics, rects);
+                start = Some((column, fg));
+            }
+            None => start = Some((column, fg)),
+        }
+    }
+
+    flush_underline_rect(start, row.len(), row_index, metrics, rects);
+}
+
+fn push_selection_rects(snapshot: &GridSnapshot, metrics: CellMetrics, rects: &mut Vec<RectPlan>) {
+    for rect in &snapshot.selection_rects {
+        rects.push(RectPlan {
+            x: rect.col as u32 * metrics.width,
+            y: rect.row as u32 * metrics.height,
+            width: rect.width as u32 * metrics.width,
+            height: rect.height as u32 * metrics.height,
+            color: DEFAULT_SELECTION_BG,
+            layer: RectLayer::Background,
+        });
+    }
 }
 
 fn push_text_segments(
@@ -522,6 +677,47 @@ fn push_text_segments(
             height: metrics.height,
             text: cell.ch.to_string(),
             style: style_for_cell(cell),
+        });
+    }
+}
+
+fn push_hyperlink_spans(row: &[Cell], row_index: usize, spans: &mut Vec<HyperlinkSpan>) {
+    let mut start = None::<(usize, usize)>;
+
+    for (column, cell) in row.iter().enumerate() {
+        match (start, cell.hyperlink) {
+            (Some((_, current_id)), Some(hyperlink_id)) if current_id == hyperlink_id => {}
+            (Some((start_col, hyperlink_id)), Some(next_id)) => {
+                spans.push(HyperlinkSpan {
+                    hyperlink_id,
+                    row: row_index,
+                    start_col,
+                    end_col: column,
+                });
+                start = Some((column, next_id));
+            }
+            (None, Some(hyperlink_id)) => {
+                start = Some((column, hyperlink_id));
+            }
+            (Some((start_col, hyperlink_id)), None) => {
+                spans.push(HyperlinkSpan {
+                    hyperlink_id,
+                    row: row_index,
+                    start_col,
+                    end_col: column,
+                });
+                start = None;
+            }
+            (None, None) => {}
+        }
+    }
+
+    if let Some((start_col, hyperlink_id)) = start {
+        spans.push(HyperlinkSpan {
+            hyperlink_id,
+            row: row_index,
+            start_col,
+            end_col: row.len(),
         });
     }
 }
@@ -766,6 +962,7 @@ struct RectPipeline {
     pipeline: RenderPipeline,
     background: RectVertexBuffer,
     overlay: RectVertexBuffer,
+    target_is_srgb: bool,
 }
 
 impl RectPipeline {
@@ -827,6 +1024,7 @@ impl RectPipeline {
             pipeline,
             background: RectVertexBuffer::new(device, "knightty background rect vertices"),
             overlay: RectVertexBuffer::new(device, "knightty overlay rect vertices"),
+            target_is_srgb: format.is_srgb(),
         }
     }
 
@@ -845,9 +1043,16 @@ impl RectPipeline {
             surface_width,
             surface_height,
             background_rects,
+            self.target_is_srgb,
         );
-        self.overlay
-            .prepare(device, queue, surface_width, surface_height, overlay_rects);
+        self.overlay.prepare(
+            device,
+            queue,
+            surface_width,
+            surface_height,
+            overlay_rects,
+            self.target_is_srgb,
+        );
     }
 
     fn draw(&self, pass: &mut RenderPass<'_>, layer: PreparedRectLayer) {
@@ -900,8 +1105,9 @@ impl RectVertexBuffer {
         surface_width: u32,
         surface_height: u32,
         rects: &[RectPlan],
+        target_is_srgb: bool,
     ) {
-        let vertices = rect_vertices(rects, surface_width, surface_height);
+        let vertices = rect_vertices(rects, surface_width, surface_height, target_is_srgb);
         self.vertex_count = vertices.len() as u32;
         if vertices.is_empty() {
             return;
@@ -922,14 +1128,19 @@ impl RectVertexBuffer {
     }
 }
 
-fn rect_vertices(rects: &[RectPlan], surface_width: u32, surface_height: u32) -> Vec<RectVertex> {
+fn rect_vertices(
+    rects: &[RectPlan],
+    surface_width: u32,
+    surface_height: u32,
+    target_is_srgb: bool,
+) -> Vec<RectVertex> {
     let mut vertices = Vec::with_capacity(rects.len() * 6);
     for rect in rects {
         let left = to_ndc_x(rect.x, surface_width);
         let right = to_ndc_x(rect.x.saturating_add(rect.width), surface_width);
         let top = to_ndc_y(rect.y, surface_height);
         let bottom = to_ndc_y(rect.y.saturating_add(rect.height), surface_height);
-        let color = rect.color.to_f32();
+        let color = rect.color.to_target_f32(target_is_srgb);
 
         vertices.extend_from_slice(&[
             RectVertex::new(left, top, color),
@@ -1044,12 +1255,29 @@ pub enum RenderError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CellMetrics, DEFAULT_BG, DEFAULT_FG, RectLayer, Rgba, TextStyle, attrs_for_style,
-        build_render_plan,
+        CellMetrics, DEFAULT_BG, DEFAULT_FG, RectLayer, RectPlan, RenderOptions, Rgba, TextStyle,
+        attrs_for_style, build_render_plan, build_render_plan_with_options,
+        unique_font_family_infos,
     };
     use glyphon::Family;
     use glyphon::cosmic_text::FeatureTag;
-    use knightty_core::{Damage, Terminal};
+    use knightty_core::{Damage, SelectionMode, SelectionPoint, Terminal};
+
+    #[test]
+    fn font_family_infos_are_sorted_trimmed_and_deduplicated() {
+        let infos = unique_font_family_infos([
+            (" Inter ", false),
+            ("CaskaydiaCove Nerd Font", true),
+            ("", true),
+            ("Inter", true),
+        ]);
+
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "CaskaydiaCove Nerd Font");
+        assert!(infos[0].monospaced);
+        assert_eq!(infos[1].name, "Inter");
+        assert!(infos[1].monospaced);
+    }
 
     #[test]
     fn render_plan_preserves_truecolor_foreground_text_style() {
@@ -1064,6 +1292,130 @@ mod tests {
                 && !segment.style.bold
                 && !segment.style.italic
         }));
+    }
+
+    #[test]
+    fn render_plan_preserves_truecolor_background_rect_color() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[48;2;0;128;255mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(plan.rects.iter().any(|rect| {
+            rect.layer == RectLayer::Background
+                && rect.x == 0
+                && rect.y == 0
+                && rect.color == Rgba::rgb(0, 128, 255)
+                && rect.color.a == 255
+        }));
+    }
+
+    #[test]
+    fn render_plan_ansi_palette_uses_saturated_base_colors() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[31mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(
+            plan.text.iter().any(|segment| {
+                segment.text == "X" && segment.style.fg == Rgba::rgb(205, 49, 49)
+            })
+        );
+    }
+
+    #[test]
+    fn render_plan_256_color_cube_uses_expected_rgb_steps() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[38;5;196mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(
+            plan.text
+                .iter()
+                .any(|segment| { segment.text == "X" && segment.style.fg == Rgba::rgb(255, 0, 0) })
+        );
+    }
+
+    #[test]
+    fn render_plan_256_grayscale_uses_expected_ramp() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[38;5;244mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(plan.text.iter().any(|segment| {
+            segment.text == "X" && segment.style.fg == Rgba::rgb(128, 128, 128)
+        }));
+    }
+
+    #[test]
+    fn render_plan_bold_keeps_truecolor_rgb() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[1;38;2;64;128;192mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(plan.text.iter().any(|segment| {
+            segment.text == "X" && segment.style.bold && segment.style.fg == Rgba::rgb(64, 128, 192)
+        }));
+    }
+
+    #[test]
+    fn render_plan_dim_sgr_does_not_modify_truecolor_rgb() {
+        let mut terminal = Terminal::new(4, 1);
+        terminal.feed(b"\x1b[2;38;2;64;128;192mX");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(
+            plan.text.iter().any(|segment| {
+                segment.text == "X" && segment.style.fg == Rgba::rgb(64, 128, 192)
+            })
+        );
+    }
+
+    #[test]
+    fn rect_vertices_keep_srgb_values_for_linear_targets() {
+        let rect = RectPlan {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+            color: Rgba::rgb(128, 64, 255),
+            layer: RectLayer::Background,
+        };
+
+        let vertices = super::rect_vertices(&[rect], 100, 100, false);
+        let color = vertices[0].color;
+
+        assert_close(color[0], 128.0 / 255.0);
+        assert_close(color[1], 64.0 / 255.0);
+        assert_close(color[2], 1.0);
+        assert_close(color[3], 1.0);
+    }
+
+    #[test]
+    fn rect_vertices_convert_srgb_values_for_srgb_targets() {
+        let rect = RectPlan {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+            color: Rgba::rgb(128, 64, 255),
+            layer: RectLayer::Background,
+        };
+
+        let vertices = super::rect_vertices(&[rect], 100, 100, true);
+        let color = vertices[0].color;
+
+        assert_close(color[0], super::srgb_channel_to_linear(128));
+        assert_close(color[1], super::srgb_channel_to_linear(64));
+        assert_close(color[2], 1.0);
+        assert_close(color[3], 1.0);
+        assert!(color[0] < 128.0 / 255.0);
+        assert!(color[1] < 64.0 / 255.0);
     }
 
     #[test]
@@ -1217,6 +1569,180 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn render_plan_includes_selection_rects_from_snapshot() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"hello");
+        terminal.begin_selection(SelectionPoint { col: 1, row: 0 }, SelectionMode::Simple);
+        terminal.update_selection(SelectionPoint { col: 3, row: 0 });
+
+        let metrics = CellMetrics::default();
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
+
+        assert_eq!(
+            plan.selection_rects,
+            vec![super::RectPlan {
+                x: metrics.width,
+                y: 0,
+                width: metrics.width * 3,
+                height: metrics.height,
+                color: super::DEFAULT_SELECTION_BG,
+                layer: RectLayer::Background,
+            }]
+        );
+    }
+
+    #[test]
+    fn render_plan_includes_hyperlink_spans_from_snapshot() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"\x1b]8;id=link;https://example.com\x07abc\x1b]8;;\x07");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert_eq!(
+            plan.hyperlink_spans,
+            vec![super::HyperlinkSpan {
+                hyperlink_id: 0,
+                row: 0,
+                start_col: 0,
+                end_col: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn render_plan_underlines_hovered_hyperlink_cells() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"\x1b]8;id=link;https://example.com\x07abc\x1b]8;;\x07");
+
+        let metrics = CellMetrics::default();
+        let plan = build_render_plan_with_options(
+            &terminal.snapshot(),
+            &Damage::Full,
+            metrics,
+            RenderOptions {
+                hovered_hyperlink_id: Some(0),
+            },
+        );
+
+        assert!(plan.rects.iter().any(|rect| {
+            rect.layer == RectLayer::Overlay
+                && rect.x == 0
+                && rect.y == metrics.height - 2
+                && rect.width == metrics.width * 3
+                && rect.height == 1
+                && rect.color == DEFAULT_FG
+        }));
+    }
+
+    #[test]
+    fn render_plan_hover_underline_coexists_with_selection_rects() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"\x1b]8;id=link;https://example.com\x07abc\x1b]8;;\x07");
+        terminal.begin_selection(SelectionPoint { col: 0, row: 0 }, SelectionMode::Simple);
+        terminal.update_selection(SelectionPoint { col: 2, row: 0 });
+
+        let metrics = CellMetrics::default();
+        let plan = build_render_plan_with_options(
+            &terminal.snapshot(),
+            &Damage::Full,
+            metrics,
+            RenderOptions {
+                hovered_hyperlink_id: Some(0),
+            },
+        );
+
+        assert!(!plan.selection_rects.is_empty());
+        assert!(plan.rects.iter().any(|rect| {
+            rect.layer == RectLayer::Overlay
+                && rect.y == metrics.height - 2
+                && rect.width == metrics.width * 3
+        }));
+    }
+
+    #[test]
+    fn render_plan_underlines_hovered_hyperlink_in_scrollback_view() {
+        let mut terminal = Terminal::with_scrollback(5, 2, 10);
+        terminal.feed(b"\x1b]8;id=hist;https://example.com\x07A\x1b]8;;\x07\r\n");
+        terminal.feed(b"B\r\nC\r\n");
+        terminal.scroll_to_top();
+
+        let metrics = CellMetrics::default();
+        let plan = build_render_plan_with_options(
+            &terminal.snapshot(),
+            &Damage::Full,
+            metrics,
+            RenderOptions {
+                hovered_hyperlink_id: Some(0),
+            },
+        );
+
+        assert!(plan.rects.iter().any(|rect| {
+            rect.layer == RectLayer::Overlay
+                && rect.x == 0
+                && rect.y == metrics.height - 2
+                && rect.width == metrics.width
+                && rect.height == 1
+        }));
+    }
+
+    #[test]
+    fn render_plan_merges_adjacent_cells_and_splits_different_hyperlinks() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"\x1b]8;id=a;https://a.example\x07AB\x1b]8;id=b;https://b.example\x07C");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert_eq!(
+            plan.hyperlink_spans,
+            vec![
+                super::HyperlinkSpan {
+                    hyperlink_id: 0,
+                    row: 0,
+                    start_col: 0,
+                    end_col: 2,
+                },
+                super::HyperlinkSpan {
+                    hyperlink_id: 1,
+                    row: 0,
+                    start_col: 2,
+                    end_col: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_plan_has_no_hyperlink_spans_without_cell_metadata() {
+        let mut terminal = Terminal::new(8, 1);
+        terminal.feed(b"abc");
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, CellMetrics::default());
+
+        assert!(plan.hyperlink_spans.is_empty());
+    }
+
+    #[test]
+    fn render_plan_selection_rect_uses_cell_metrics() {
+        let mut terminal = Terminal::new(8, 2);
+        terminal.feed(b"hello\r\nworld");
+        terminal.begin_selection(SelectionPoint { col: 2, row: 1 }, SelectionMode::Simple);
+        terminal.update_selection(SelectionPoint { col: 4, row: 1 });
+
+        let metrics = CellMetrics {
+            width: 11,
+            height: 23,
+            font_size: 16.0,
+            line_height: 23.0,
+        };
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
+
+        assert_eq!(plan.selection_rects[0].x, 22);
+        assert_eq!(plan.selection_rects[0].y, 23);
+        assert_eq!(plan.selection_rects[0].width, 33);
+        assert_eq!(plan.selection_rects[0].height, 23);
+    }
+
     fn assert_disabled_feature(attrs: &glyphon::Attrs<'_>, tag: FeatureTag) {
         assert!(
             attrs
@@ -1225,6 +1751,13 @@ mod tests {
                 .iter()
                 .any(|feature| feature.tag == tag && feature.value == 0),
             "feature {tag:?} should be disabled"
+        );
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {actual} to be close to {expected}"
         );
     }
 }

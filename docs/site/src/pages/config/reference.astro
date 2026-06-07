@@ -1,0 +1,33 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+
+import ConfigReferenceApp from '../../components/ConfigReferenceApp';
+import { getConfigReference } from '../../lib/config-reference';
+import { slugify } from '../../lib/slug';
+import '../../styles/config-reference.css';
+
+const reference = await getConfigReference();
+const headings = reference.categories.map((category) => ({
+	depth: 2,
+	slug: `category-${slugify(category)}`,
+	text: category,
+}));
+---
+
+<StarlightPage
+	frontmatter={{
+		title: 'Config Reference',
+		description: 'Knightty configuration reference.',
+		editUrl: false,
+	}}
+	headings={headings}
+>
+	<ConfigReferenceApp
+		options={reference.options}
+		categories={reference.categories}
+		reloadBehaviors={reference.reloadBehaviors}
+		platforms={reference.platforms}
+		source={reference.source}
+		client:load
+	/>
+</StarlightPage>

@@ -135,7 +135,216 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 
 ---
 
-## 5. コーディング規約
+## 5. ドキュメントサイトと設定リファレンス(Astro)
+
+Knightty のユーザー向けドキュメントサイトは **Astro** で作る。目的は、Ghostty の config reference のように、ユーザーが設定可能な項目を一覧し、説明・型・デフォルト値・記述例・注意事項を確認できる静的ドキュメントを提供すること。
+
+ただし、Ghostty の UI や実装をそのまま模倣するのではなく、Knightty の設定体系を **構造化メタデータから生成する**。手書きページを増やして実装と乖離させないこと。
+
+### 配置
+
+Astro サイトは以下に置く。
+
+```txt
+docs/site
+```
+
+生成済み設定リファレンス JSON は以下に置く。
+
+```txt
+docs/generated/config-reference.json
+```
+
+`docs/generated/config-reference.json` がまだ存在しない初期段階のみ、Astro 側に fixture を置いてよい。
+
+```txt
+docs/site/src/data/config-reference.fixture.json
+```
+
+fixture は開発用の仮データであり、恒久的な source of truth にしてはいけない。
+
+### 設定リファレンスの source of truth
+
+設定項目の正は Rust 側の設定メタデータに置く。Astro 側で設定項目名・デフォルト値・説明を重複管理しない。
+
+推奨構成:
+
+```txt
+crates/app/src/config.rs              # 実際の設定構造・読み込み
+crates/app/src/config_spec.rs         # ドキュメント生成用メタデータ
+docs/generated/config-reference.json  # xtask で生成
+docs/site                             # Astro サイト
+```
+
+生成コマンドは以下を目標にする。
+
+```bash
+cargo run -p xtask -- generate-config-docs
+```
+
+Astro 側は `docs/generated/config-reference.json` を優先して読み、存在しない場合だけ fixture を使う。
+
+### 設定項目のデータ shape
+
+Astro 側では以下の TypeScript 型を基準にする。
+
+```ts
+type ConfigOption = {
+  key: string;
+  category: string;
+  type: string;
+  default: string | number | boolean | string[] | null;
+  description: string;
+  examples: string[];
+  validValues?: string[];
+  reload: "runtime" | "new-terminal" | "restart";
+  platform: "all" | "windows" | "linux" | "macos";
+  security?: string;
+  since?: string;
+  deprecated?: boolean;
+};
+```
+
+Rust 側の `config_spec.rs` でも、概念的に同じ情報を保持する。
+
+各設定項目は最低限、以下を持つこと。
+
+- `key`: ユーザーが設定ファイルに書く名前
+- `category`: 表示グルーピング
+- `type`: `bool` / `int` / `float` / `string` / `list<string>` / `enum` / `color` など
+- `default`: 未設定時の値
+- `description`: ユーザー向け説明
+- `examples`: コピペ可能な設定例。複数可
+- `validValues`: enum や allowlist がある場合
+- `reload`: 反映タイミング
+- `platform`: 対象プラットフォーム
+- `security`: URL open、clipboard、shell 起動など安全性に関わる注意
+- `since`: 追加バージョン
+- `deprecated`: 非推奨設定かどうか
+
+### Astro ページ要件
+
+設定リファレンスページは以下の URL に作る。
+
+```txt
+/config/reference/
+```
+
+最低限必要な UI:
+
+- タイトルと短い説明
+- 検索 input
+- category filter
+- reload behavior filter
+- platform filter
+- 左側ナビゲーション(category ごと)
+- 設定項目カード
+- 各設定項目への anchor link
+- `type` 表示
+- `default` 表示
+- `validValues` 表示
+- `examples` 表示
+- `security` note 表示
+- `since` 表示
+- `deprecated` badge 表示
+
+検索・フィルタ以外のために client-side JavaScript を増やさない。ドキュメントサイトとして、基本は静的 HTML を優先する。
+
+### Astro 実装方針
+
+- Astro + TypeScript を使う。
+- React / Vue / Svelte などの UI framework は入れない。
+- コンポーネントライブラリは入れない。必要になるまで素の Astro component と CSS で作る。
+- CSS は CSS variables を使い、terminal-like で compact な見た目にする。
+- dark theme first でよい。
+- 大きなアニメーションは不要。
+- `key` から URL anchor 用 slug を安全に生成する。
+- データが空でもページを壊さない。
+- `examples` が複数ある場合はすべて表示する。
+- `security` がある設定は通常の note より目立たせる。
+
+推奨構成:
+
+```txt
+docs/site/
+  astro.config.mjs
+  package.json
+  tsconfig.json
+  src/
+    data/
+      config-reference.fixture.json
+    lib/
+      config-reference.ts
+      slug.ts
+    layouts/
+      DocsLayout.astro
+    pages/
+      index.astro
+      config/
+        reference.astro
+    components/
+      ConfigReferencePage.astro
+      ConfigOptionCard.astro
+      ConfigFilters.astro
+      ConfigSidebar.astro
+    styles/
+      global.css
+```
+
+### Astro の検証コマンド
+
+`docs/site` 内では `pnpm` を使う。
+
+```bash
+cd docs/site
+pnpm install
+pnpm astro check
+pnpm build
+```
+
+依存が未導入・workspace 未整備などでコマンドが失敗する場合は、失敗内容を明記し、コードを中途半端に壊した状態で終えない。
+
+### 設定追加時の必須手順
+
+新しいユーザー設定を追加する場合は、実装と同じ PR/作業単位で以下を行う。
+
+1. `config.rs` または既存の設定読み込み箇所に実設定を追加する。
+2. parser に設定 key を追加する。
+3. `config_spec.rs` に説明・型・デフォルト値・例・反映タイミングを追加する。
+4. `cargo run -p xtask -- generate-config-docs` で `docs/generated/config-reference.json` を更新する。
+5. Astro の `/config/reference/` で表示が崩れないことを確認する。
+6. parser key と config spec key の一致をテストする。
+
+parser に存在する key が config spec に存在しない、または config spec に存在する key が parser で解釈できない状態を許さない。
+
+### 設定リファレンスで特に注意する項目
+
+以下のような設定は、必ず `security` note を付ける。
+
+- OSC 8 hyperlink を外部ブラウザで開く設定
+- 許可する URL scheme
+- OSC 52 clipboard
+- shell integration
+- 外部コマンド起動
+- SSH/terminfo 自動配布
+- ローカルファイルパスや作業ディレクトリを外部へ渡す機能
+
+安全性に関わる設定では、便利さよりも明示性を優先する。allowlist・無効化方法・デフォルト挙動を必ず書く。
+
+### Codex / coding agent への作業完了報告
+
+ドキュメントサイト関連の作業を終えたら、最後に以下を報告する。
+
+- 変更したファイル一覧
+- 実装した UI / 生成処理
+- fixture から generated JSON に切り替える方法
+- 実行したコマンド
+- 失敗したコマンドがあれば、その理由
+- 残 TODO
+
+---
+
+## 6. コーディング規約
 
 - 静的型付けの利点を活かす。`unwrap()` はプロトタイプ以外で避け、エラーは型で表現する。
 - `core` には GUI・wgpu・winit を一切持ち込まない(依存の向きを壊さない)。
@@ -144,10 +353,11 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 - ホットパス(パース・描画ループ)にアロケーションを増やさない。グリフは個別キャッシュ。
 - **依存追加は純 Rust を優先**。新しいクレートを足す前に、C/C++ ビルドや `*-sys` を引き込まないか確認する。引き込む場合は本ファイルに理由を残す。
 - テストは**第一級のドキュメント**として書く(セクション4のテスト方針を参照)。新しい挙動を足したら、読めば使い方が分かる単体テスト(または公開APIなら doctest)を必ず添える。
+- ユーザー設定を追加・変更したら、同じ作業単位で `config_spec.rs` と `docs/generated/config-reference.json` を更新する。設定仕様とドキュメントの乖離を残さない。
 
 ---
 
-## 6. やってはいけないこと(重要)
+## 7. やってはいけないこと(重要)
 
 調査で明確に「アンチパターン」と分かっているもの。提案・実装する前に必ず確認すること。
 
@@ -158,10 +368,12 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 5. **debug ビルドでの性能判断**。
 6. **理由のない C/C++ 依存の追加**。Skia、HarfBuzz の C バインディング、その他 `*-sys` でビルドを複雑にしない。純 Rust の代替を先に探す(例: シェイピングは harfbuzz C ではなく cosmic-text/rustybuzz)。
 7. **テストを伴わない挙動追加**。新しいエスケープシーケンスや状態遷移を足したら、それ単体の細かいテストを実バイト列で必ず書く。
+8. **Astro 側への設定リファレンス手書き固定**。設定名・デフォルト値・説明を Astro component に直接埋め込まない。初期 fixture を除き、Rust 側メタデータから生成された JSON を使う。
+9. **ドキュメントサイトの過剰 SPA 化**。検索・フィルタ以外のために client-side JavaScript を増やさない。React/Vue/Svelte 等の導入も明示指示なしに行わない。
 
 ---
 
-## 7. 実装フェーズ
+## 8. 実装フェーズ
 
 | フェーズ | 内容 | 完了条件 |
 |---|---|---|
@@ -170,6 +382,7 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 | 2 | 描画 | グリフアトラス+キャッシュ、cosmic-text シェイピング、ダメージトラッキング、同期更新(DECSET 2026) |
 | 3 | UX/互換性 | truecolor → undercurl(CSI 4:3 + 58色)+ 独自terminfo → OSC 133 → OSC 8 → Kittyキーボード → Kittyグラフィックス → ssh時terminfo自動配布 |
 | 4 | マルチプレクサ・最適化 | ネイティブタブ/分割、read/render/io スレッド分離、入力遅延チューニング |
+| Docs | 設定リファレンス | Rust config metadata → JSON → Astro `/config/reference/` の生成・表示が動く |
 
 ### フェーズ3の互換性チェックリスト(neovim/lazygit/ssh向け)
 - [ ] トゥルーカラー `CSI 38;2;R;G;B m`
@@ -191,7 +404,7 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 
 ---
 
-## 8. 参考リソース
+## 9. 参考リソース
 
 - Alacritty / WezTerm / Ghostty / Rio の DeepWiki(アーキテクチャ解説)
 - Mitchell Hashimoto の Ghostty Devlog(005: terminal inspector、006: SIMDパーサ)
@@ -201,8 +414,8 @@ fn csi_truecolor_split_across_two_feeds_still_parses() {
 
 ---
 
-## 9. 設計の前提・注意
+## 10. 設計の前提・注意
 
 - **Ghostty は Zig 製**。設計思想は参考になるがコードは直接流用できない。`libghostty-vt` は将来 C 互換ライブラリとして FFI 利用できる可能性がある(現時点では未確定)。
 - **Ghostty の Windows 対応は未実装**(ロードマップ上)。Windows の参照実装は WezTerm / Rio を見る。
-- **CJK・入力メソッド**は plataform 差が大きい(カーソル位置・候補ウィンドウ・合成状態)。Windows ConPTY と Unix PTY の差はシグナル処理・プロセスライフサイクルで顕在化する。早めに実機で確認する。
+- **CJK・入力メソッド**は platform 差が大きい(カーソル位置・候補ウィンドウ・合成状態)。Windows ConPTY と Unix PTY の差はシグナル処理・プロセスライフサイクルで顕在化する。早めに実機で確認する。

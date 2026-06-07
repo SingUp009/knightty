@@ -1,0 +1,326 @@
+:root {
+  --kr-bg: #07110f;
+  --kr-panel: #0d1916;
+  --kr-panel-strong: #13231f;
+  --kr-line: #244139;
+  --kr-line-strong: #3f6f63;
+  --kr-text: #e7f3ee;
+  --kr-muted: #9eb8af;
+  --kr-subtle: #6d8b82;
+  --kr-accent: #49d49f;
+  --kr-accent-2: #61c7e8;
+  --kr-warn: #f2be63;
+  --kr-danger: #ff8a8a;
+  --kr-code: #081513;
+  --kr-radius: 8px;
+}
+
+.config-reference {
+  color: var(--kr-text);
+}
+
+.config-reference__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.config-reference__eyebrow {
+  margin: 0 0 0.35rem;
+  color: var(--kr-accent);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.config-reference h1 {
+  margin: 0;
+  font-size: clamp(2rem, 4vw, 3rem);
+  letter-spacing: 0;
+}
+
+.config-reference__lede {
+  max-width: 64ch;
+  margin: 0.75rem 0 0;
+  color: var(--kr-muted);
+}
+
+.config-reference__meta {
+  align-self: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  min-width: 11rem;
+}
+
+.config-reference__meta span,
+.config-option__badge {
+  border: 1px solid var(--kr-line);
+  border-radius: 999px;
+  background: var(--kr-panel);
+  color: var(--kr-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0.4rem 0.55rem;
+}
+
+.config-reference__filters {
+  display: grid;
+  grid-template-columns: minmax(16rem, 1.4fr) repeat(3, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0 1.5rem;
+  padding: 0.85rem;
+  border: 1px solid var(--kr-line);
+  border-radius: var(--kr-radius);
+  background: var(--kr-panel);
+}
+
+.config-reference__field {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.config-reference__field span,
+.config-reference__nav p,
+.config-option__facts dt,
+.config-option__examples p {
+  margin: 0;
+  color: var(--kr-subtle);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.config-reference__field input,
+.config-reference__field select {
+  width: 100%;
+  min-height: 2.45rem;
+  border: 1px solid var(--kr-line);
+  border-radius: 6px;
+  background: var(--kr-bg);
+  color: var(--kr-text);
+  font: inherit;
+  padding: 0.55rem 0.7rem;
+}
+
+.config-reference__field input:focus,
+.config-reference__field select:focus {
+  outline: 2px solid var(--kr-accent-2);
+  outline-offset: 2px;
+}
+
+.config-reference__body {
+  display: grid;
+  grid-template-columns: minmax(10rem, 13rem) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.config-reference__nav {
+  position: sticky;
+  top: 1rem;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.75rem;
+  border: 1px solid var(--kr-line);
+  border-radius: var(--kr-radius);
+  background: var(--kr-panel);
+}
+
+.config-reference__nav a {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 6px;
+  color: var(--kr-text);
+  padding: 0.45rem 0.5rem;
+  text-decoration: none;
+}
+
+.config-reference__nav a:hover {
+  background: var(--kr-panel-strong);
+  color: var(--kr-accent);
+}
+
+.config-reference__nav small {
+  color: var(--kr-muted);
+}
+
+.config-reference__list,
+.config-reference__group {
+  display: grid;
+  gap: 1rem;
+}
+
+.config-reference__group-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--kr-line);
+  padding-bottom: 0.45rem;
+}
+
+.config-reference__group-heading h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: 0;
+}
+
+.config-reference__group-heading span {
+  color: var(--kr-muted);
+  font-size: 0.82rem;
+}
+
+.config-reference__empty,
+.config-option {
+  border: 1px solid var(--kr-line);
+  border-radius: var(--kr-radius);
+  background: var(--kr-panel);
+}
+
+.config-reference__empty {
+  margin: 0;
+  color: var(--kr-muted);
+  padding: 1rem;
+}
+
+.config-option {
+  scroll-margin-top: 1rem;
+  padding: 1rem;
+}
+
+.config-option:target {
+  border-color: var(--kr-accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--kr-accent) 60%, transparent);
+}
+
+.config-option__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.config-option__header > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.config-option__anchor {
+  color: var(--kr-accent-2);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.config-option h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.config-option__badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.config-option__badge--warn {
+  border-color: color-mix(in srgb, var(--kr-warn) 70%, var(--kr-line));
+  color: var(--kr-warn);
+}
+
+.config-option__description {
+  margin: 0 0 0.85rem;
+  color: var(--kr-muted);
+}
+
+.config-option__facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0 0 0.85rem;
+}
+
+.config-option__facts div {
+  min-width: 0;
+}
+
+.config-option__facts dd {
+  margin: 0.2rem 0 0;
+  color: var(--kr-text);
+  overflow-wrap: anywhere;
+}
+
+.config-option code,
+.config-option pre {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+.config-option code {
+  border-radius: 4px;
+  background: var(--kr-code);
+  padding: 0.1rem 0.25rem;
+}
+
+.config-option__security {
+  margin: 0 0 0.85rem;
+  border-left: 3px solid var(--kr-warn);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--kr-warn) 12%, var(--kr-panel));
+  color: var(--kr-text);
+  padding: 0.6rem 0.7rem;
+}
+
+.config-option__examples {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.config-option__examples pre {
+  margin: 0;
+  overflow-x: auto;
+  border: 1px solid var(--kr-line);
+  border-radius: 6px;
+  background: var(--kr-code);
+  color: var(--kr-text);
+  padding: 0.75rem;
+}
+
+.config-option__examples code {
+  background: transparent;
+  padding: 0;
+}
+
+@media (max-width: 58rem) {
+  .config-reference__header,
+  .config-option__header {
+    flex-direction: column;
+  }
+
+  .config-reference__meta,
+  .config-option__badges {
+    justify-content: flex-start;
+  }
+
+  .config-reference__filters,
+  .config-reference__body,
+  .config-option__facts {
+    grid-template-columns: 1fr;
+  }
+
+  .config-reference__nav {
+    position: static;
+  }
+}

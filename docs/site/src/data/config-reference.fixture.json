@@ -1,0 +1,150 @@
+[
+  {
+    "key": "font.family",
+    "category": "Font",
+    "type": "string",
+    "default": null,
+    "description": "Renderer に渡すフォントファミリー名。未指定時はレンダラーの既定フォントを使います。",
+    "examples": ["{\n  \"font\": {\n    \"family\": \"CaskaydiaCove Nerd Font\"\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "font.size",
+    "category": "Font",
+    "type": "float",
+    "default": 16,
+    "description": "セルメトリクスの基準になるフォントサイズ。0 より大きい値を指定します。",
+    "examples": ["{\n  \"font\": {\n    \"size\": 18\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "font.line_height",
+    "category": "Font",
+    "type": "float",
+    "default": null,
+    "description": "セルの行高。未指定時はフォントサイズに合わせたレンダラー既定値を使います。",
+    "examples": ["{\n  \"font\": {\n    \"line_height\": 22\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.initial_cols",
+    "category": "Window",
+    "type": "int",
+    "default": 80,
+    "description": "起動時に作成する端末グリッドの列数。0 より大きい値を指定します。",
+    "examples": ["{\n  \"window\": {\n    \"initial_cols\": 120\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.initial_rows",
+    "category": "Window",
+    "type": "int",
+    "default": 24,
+    "description": "起動時に作成する端末グリッドの行数。0 より大きい値を指定します。",
+    "examples": ["{\n  \"window\": {\n    \"initial_rows\": 36\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "render.wgpu_backend",
+    "category": "Render",
+    "type": "enum",
+    "default": "auto",
+    "description": "wgpu の描画バックエンド。環境変数 KNIGHTTY_WGPU_BACKEND がある場合はそちらが優先されます。",
+    "examples": ["{\n  \"render\": {\n    \"wgpu_backend\": \"gl\"\n  }\n}"],
+    "validValues": ["auto", "vulkan", "dx12", "gl"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "terminal.scrollback_lines",
+    "category": "Terminal",
+    "type": "int",
+    "default": 10000,
+    "description": "保持するスクロールバック行数。0 から 100000 までの値を指定できます。",
+    "examples": ["{\n  \"terminal\": {\n    \"scrollback_lines\": 20000\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "terminal.scroll_multiplier",
+    "category": "Terminal",
+    "type": "int",
+    "default": 3,
+    "description": "通常スクロール時に 1 wheel step あたり移動する行数。1 から 100 までの値を指定できます。",
+    "examples": ["{\n  \"terminal\": {\n    \"scroll_multiplier\": 5\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "shell.program",
+    "category": "Shell",
+    "type": "string",
+    "default": null,
+    "description": "起動する shell program。未指定時は platform の既定 shell を使います。",
+    "examples": ["{\n  \"shell\": {\n    \"program\": \"pwsh\"\n  }\n}"],
+    "reload": "new-terminal",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "shell.args",
+    "category": "Shell",
+    "type": "list<string>",
+    "default": [],
+    "description": "shell program に渡す引数の配列。",
+    "examples": [
+      "{\n  \"shell\": {\n    \"program\": \"pwsh\",\n    \"args\": [\"-NoLogo\"]\n  }\n}"
+    ],
+    "reload": "new-terminal",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.open_on_ctrl_click",
+    "category": "Hyperlink",
+    "type": "bool",
+    "default": true,
+    "description": "Ctrl click で OSC 8 hyperlink を開くかどうか。",
+    "examples": ["{\n  \"hyperlink\": {\n    \"open_on_ctrl_click\": false\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "security": "有効にすると許可された scheme の URL を OS の既定ハンドラーで開きます。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.allowed_schemes",
+    "category": "Hyperlink",
+    "type": "list<string>",
+    "default": ["https", "http"],
+    "description": "Ctrl click で開くことを許可する URL scheme。空配列にすると hyperlink open は無効になります。",
+    "examples": ["{\n  \"hyperlink\": {\n    \"allowed_schemes\": [\"https\"]\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "security": "許可した scheme は外部アプリケーション起動につながるため、必要な scheme のみに絞ってください。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.underline_on_hover",
+    "category": "Hyperlink",
+    "type": "bool",
+    "default": true,
+    "description": "hover 中の hyperlink に underline 表示を付けるかどうか。",
+    "examples": ["{\n  \"hyperlink\": {\n    \"underline_on_hover\": false\n  }\n}"],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  }
+]

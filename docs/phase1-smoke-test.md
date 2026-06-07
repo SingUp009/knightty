@@ -68,6 +68,9 @@ Expected result:
 - Enter, Backspace, Tab, Ctrl+C, and arrow keys send the expected basic sequences.
 - Window resize updates terminal dimensions and does not crash.
 
+For current OSC 8 hyperlink, selection, copy, and paste regression checks on Windows
+PowerShell, use the manual checklist in `docs/PHASE4-E.md`.
+
 ## Not In Scope
 
 - Glyph atlas optimization.

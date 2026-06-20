@@ -1,0 +1,14 @@
+[package]
+name = "knightty-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A terminal animation workload for Knightty performance checks."
+
+[[bin]]
+name = "knightty-demo"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29.0"
+thiserror = "2.0.18"

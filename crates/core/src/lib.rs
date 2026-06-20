@@ -35,6 +35,7 @@ pub struct Terminal {
     pending_compat_input: Vec<u8>,
     mouse_state: MouseModeState,
     selection: Option<SelectionState>,
+    image_placements: Vec<ImagePlacement>,
 }
 
 /// Enabled xterm mouse reporting protocol.
@@ -138,6 +139,45 @@ pub struct SelectionRect {
     pub height: usize,
 }
 
+/// Stable identifier for an image resource owned outside the terminal core.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ImageId(u64);
+
+impl ImageId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Stable identifier for one logical placement of an image resource.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ImagePlacementId(u64);
+
+impl ImagePlacementId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Terminal-grid position. Rows may be negative while an image is in scrollback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GridPoint {
+    pub col: usize,
+    pub row: isize,
+}
+
+/// Logical cell placement for one externally-owned image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImagePlacement {
+    pub placement_id: ImagePlacementId,
+    pub image_id: ImageId,
+    pub anchor: GridPoint,
+    pub columns: u16,
+    pub rows: u16,
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
 impl Terminal {
     /// Create a terminal with the provided visible grid size.
     ///
@@ -179,6 +219,7 @@ impl Terminal {
             pending_compat_input: Vec::new(),
             mouse_state: MouseModeState::default(),
             selection: None,
+            image_placements: Vec::new(),
         }
     }
 
@@ -189,6 +230,124 @@ impl Terminal {
         self.term.resize(size);
         self.damage = Damage::Full;
         self.term.reset_damage();
+    }
+
+    /// Return the current cursor position for a new image anchor.
+    pub fn image_anchor(&self) -> GridPoint {
+        let cursor = self.term.grid().cursor.point;
+        GridPoint {
+            col: cursor.column.0,
+            row: cursor.line.0 as isize,
+        }
+    }
+
+    /// Add a logical image placement without taking ownership of image pixels.
+    pub fn add_image_placement(&mut self, placement: ImagePlacement) {
+        self.image_placements.push(placement);
+        self.mark_full_damage();
+    }
+
+    /// Add a placement or atomically replace the placement with the same id.
+    pub fn upsert_image_placement(&mut self, placement: ImagePlacement) {
+        if let Some(existing) = self
+            .image_placements
+            .iter_mut()
+            .find(|existing| existing.placement_id == placement.placement_id)
+        {
+            *existing = placement;
+        } else {
+            self.image_placements.push(placement);
+        }
+        self.mark_full_damage();
+    }
+
+    /// Remove one logical image placement.
+    pub fn remove_image_placement(&mut self, placement_id: ImagePlacementId) {
+        let previous_len = self.image_placements.len();
+        self.image_placements
+            .retain(|placement| placement.placement_id != placement_id);
+        if self.image_placements.len() != previous_len {
+            self.mark_full_damage();
+        }
+    }
+
+    /// Remove all placements that reference one image resource.
+    pub fn remove_image_placements(&mut self, image_id: ImageId) {
+        let previous_len = self.image_placements.len();
+        self.image_placements
+            .retain(|placement| placement.image_id != image_id);
+        if self.image_placements.len() != previous_len {
+            self.mark_full_damage();
+        }
+    }
+
+    /// Remove every image placement.
+    pub fn clear_image_placements(&mut self) {
+        if !self.image_placements.is_empty() {
+            self.image_placements.clear();
+            self.mark_full_damage();
+        }
+    }
+
+    /// Iterate over all image resources still referenced by terminal history.
+    pub fn image_placement_ids(&self) -> impl Iterator<Item = ImageId> + '_ {
+        self.image_placements
+            .iter()
+            .map(|placement| placement.image_id)
+    }
+
+    /// Iterate over stable ids for logical placements still in terminal history.
+    pub fn placement_ids(&self) -> impl Iterator<Item = ImagePlacementId> + '_ {
+        self.image_placements
+            .iter()
+            .map(|placement| placement.placement_id)
+    }
+
+    /// Advance the terminal cursor after displaying a block image.
+    pub fn advance_after_image_rows(&mut self, rows: u16) {
+        if rows == 0 {
+            return;
+        }
+
+        let previous_history = self.term.grid().history_size();
+        for _ in 0..rows {
+            self.processor.advance(&mut self.term, b"\r\n");
+        }
+        self.apply_output_scroll(previous_history);
+        let damage = self.collect_damage();
+        self.damage = merge_damage(
+            core::mem::replace(&mut self.damage, Damage::None),
+            merge_damage(damage, Damage::Full),
+        );
+    }
+
+    /// Move the cursor to the cell immediately following a Kitty image rectangle.
+    pub fn move_after_kitty_image(&mut self, columns: u16, rows: u16) {
+        if columns == 0 || rows == 0 {
+            return;
+        }
+
+        let terminal_columns = self.term.grid().columns().max(1);
+        let cursor_column = self.term.grid().cursor.point.column.0;
+        let horizontal = cursor_column.saturating_add(usize::from(columns));
+        let wrapped = usize::from(horizontal >= terminal_columns);
+        let target_column = if wrapped == 0 { horizontal } else { 0 };
+        let down = usize::from(rows.saturating_sub(1)).saturating_add(wrapped);
+
+        let mut sequence = Vec::with_capacity(32);
+        if down != 0 {
+            sequence.extend_from_slice(format!("\x1b[{down}B").as_bytes());
+        }
+        sequence.extend_from_slice(format!("\x1b[{}G", target_column + 1).as_bytes());
+
+        let previous_history = self.term.grid().history_size();
+        self.processor.advance(&mut self.term, &sequence);
+        self.apply_output_scroll(previous_history);
+        let damage = self.collect_damage();
+        self.damage = merge_damage(
+            core::mem::replace(&mut self.damage, Damage::None),
+            merge_damage(damage, Damage::Full),
+        );
     }
 
     /// Return the number of lines currently stored in the active screen scrollback.
@@ -269,16 +428,22 @@ impl Terminal {
 
         self.clear_selection();
         self.scroll_to_bottom();
+        let previous_history = self.term.grid().history_size();
 
         let mut input = core::mem::take(&mut self.pending_compat_input);
         input.extend_from_slice(bytes);
+        let reset_images = input.windows(2).any(|window| window == b"\x1bc");
 
         let pending_start = self.process_compat_input(&input);
         if pending_start < input.len() {
             self.pending_compat_input
                 .extend_from_slice(&input[pending_start..]);
         }
+        if reset_images {
+            self.clear_image_placements();
+        }
         self.apply_title_events();
+        self.apply_output_scroll(previous_history);
 
         let damage = self.collect_damage();
         self.damage = merge_damage(core::mem::replace(&mut self.damage, Damage::None), damage);
@@ -534,6 +699,25 @@ impl Terminal {
         let mut cells = vec![Cell::default(); cols * rows];
         let mut hyperlinks = Vec::new();
         let mut hyperlink_indexes = HashMap::<Hyperlink, usize>::new();
+        let image_placements = self
+            .image_placements
+            .iter()
+            .filter_map(|placement| {
+                let visible_row = placement.anchor.row + display_offset as isize;
+                let bottom = visible_row + placement.rows as isize;
+                if bottom <= 0 || visible_row >= rows as isize {
+                    return None;
+                }
+
+                Some(ImagePlacement {
+                    anchor: GridPoint {
+                        col: placement.anchor.col,
+                        row: visible_row,
+                    },
+                    ..*placement
+                })
+            })
+            .collect();
 
         for indexed in grid.display_iter() {
             let viewport_line = indexed.point.line.0 + display_offset as i32;
@@ -577,6 +761,7 @@ impl Terminal {
             cells,
             hyperlinks,
             selection_rects: self.selection_rects(),
+            image_placements,
             cursor: Cursor {
                 x: cursor_x,
                 y: cursor_y,
@@ -622,6 +807,22 @@ impl Terminal {
         };
         self.term.reset_damage();
         damage
+    }
+
+    fn apply_output_scroll(&mut self, previous_history: usize) {
+        let current_history = self.term.grid().history_size();
+        let added_history = current_history.saturating_sub(previous_history);
+        if added_history != 0 {
+            let shift = isize::try_from(added_history).unwrap_or(isize::MAX);
+            for placement in &mut self.image_placements {
+                placement.anchor.row = placement.anchor.row.saturating_sub(shift);
+            }
+            self.mark_full_damage();
+        }
+
+        let topmost_row = -(current_history as isize);
+        self.image_placements
+            .retain(|placement| placement.anchor.row + placement.rows as isize > topmost_row);
     }
 
     fn scroll_display(&mut self, scroll: Scroll) -> Damage {
@@ -1295,6 +1496,7 @@ pub struct GridSnapshot {
     pub cells: Vec<Cell>,
     pub hyperlinks: Vec<Hyperlink>,
     pub selection_rects: Vec<SelectionRect>,
+    pub image_placements: Vec<ImagePlacement>,
     pub cursor: Cursor,
 }
 
@@ -1474,9 +1676,10 @@ fn merge_damage(current: Damage, next: Damage) -> Damage {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, Damage, MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URI_BYTES, MAX_WINDOW_TITLE_CHARS,
-        MouseButton, MouseEncoding, MouseEventKind, MouseModes, MouseProtocol, SelectionMode,
-        SelectionPoint, SelectionRect, Terminal, TerminalMouseEvent,
+        Color, Damage, GridPoint, ImageId, ImagePlacement, ImagePlacementId,
+        MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URI_BYTES, MAX_WINDOW_TITLE_CHARS, MouseButton,
+        MouseEncoding, MouseEventKind, MouseModes, MouseProtocol, SelectionMode, SelectionPoint,
+        SelectionRect, Terminal, TerminalMouseEvent,
     };
 
     #[test]
@@ -1829,6 +2032,33 @@ mod tests {
         term.update_selection(point(4, 0));
 
         assert_eq!(term.selected_text(), Some("hello".to_owned()));
+    }
+
+    #[test]
+    fn scrollback_hyperlink_selection_copies_display_text_only() {
+        let mut term = Terminal::with_scrollback(8, 2, 10);
+        term.feed(b"\x1b]8;id=hist;https://example.com\x07LINK\x1b]8;;\x07\r\n");
+        term.feed(b"NEXT\r\nTAIL\r\n");
+        term.scroll_to_top();
+        let grid = term.snapshot();
+        let (column, row) = find_cell(&grid, 'L').expect("history link should be visible");
+
+        assert_eq!(
+            grid.hyperlink_at_cell(column, row),
+            Some(&super::Hyperlink {
+                id: Some("hist".to_owned()),
+                uri: "https://example.com".to_owned(),
+            })
+        );
+
+        let start = term.selection_point_for_visible_cell(column, row).unwrap();
+        let end = term
+            .selection_point_for_visible_cell(column + 3, row)
+            .unwrap();
+        term.begin_selection(start, SelectionMode::Simple);
+        term.update_selection(end);
+
+        assert_eq!(term.selected_text(), Some("LINK".to_owned()));
     }
 
     #[test]
@@ -2708,6 +2938,137 @@ mod tests {
         assert_eq!(term.scrollback_len(), 0);
     }
 
+    #[test]
+    fn image_placement_uses_current_cursor_as_anchor() {
+        let mut term = Terminal::new(10, 4);
+        term.feed(b"\x1b[2;3H");
+        let anchor = term.image_anchor();
+        let placement = image_placement(anchor, 2);
+
+        term.add_image_placement(placement);
+
+        assert_eq!(term.snapshot().image_placements, vec![placement]);
+        assert_eq!(term.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn image_placement_id_upserts_and_removes_one_logical_placement() {
+        let mut term = Terminal::new(10, 4);
+        let original = image_placement(GridPoint { col: 0, row: 0 }, 2);
+        term.add_image_placement(original);
+        let replacement = ImagePlacement {
+            anchor: GridPoint { col: 4, row: 1 },
+            ..original
+        };
+
+        term.upsert_image_placement(replacement);
+
+        assert_eq!(term.snapshot().image_placements, vec![replacement]);
+        term.remove_image_placement(replacement.placement_id);
+        assert!(term.snapshot().image_placements.is_empty());
+    }
+
+    #[test]
+    fn removing_image_placements_preserves_other_image_resources() {
+        let mut term = Terminal::new(10, 4);
+        let first = image_placement(GridPoint { col: 0, row: 0 }, 1);
+        let second = ImagePlacement {
+            placement_id: ImagePlacementId::new(2),
+            image_id: ImageId::new(2),
+            anchor: GridPoint { col: 1, row: 0 },
+            ..first
+        };
+        term.add_image_placement(first);
+        term.add_image_placement(second);
+
+        term.remove_image_placements(first.image_id);
+
+        assert_eq!(term.snapshot().image_placements, vec![second]);
+    }
+
+    #[test]
+    fn advancing_after_image_moves_cursor_by_image_rows() {
+        let mut term = Terminal::new(10, 6);
+        term.feed(b"\x1b[2;3H");
+
+        term.advance_after_image_rows(3);
+
+        let cursor = term.snapshot().cursor;
+        assert_eq!((cursor.x, cursor.y), (0, 4));
+    }
+
+    #[test]
+    fn kitty_image_cursor_moves_after_rectangle_without_writing_cells() {
+        let mut term = Terminal::new(10, 6);
+        term.feed(b"\x1b[2;3H");
+
+        term.move_after_kitty_image(3, 2);
+
+        let snapshot = term.snapshot();
+        assert_eq!((snapshot.cursor.x, snapshot.cursor.y), (5, 2));
+        assert!(snapshot.cells.iter().all(|cell| cell.ch == ' '));
+    }
+
+    #[test]
+    fn kitty_image_cursor_wraps_to_column_zero_at_right_edge() {
+        let mut term = Terminal::new(10, 6);
+        term.feed(b"\x1b[1;9H");
+
+        term.move_after_kitty_image(3, 2);
+
+        let cursor = term.snapshot().cursor;
+        assert_eq!((cursor.x, cursor.y), (0, 2));
+    }
+
+    #[test]
+    fn image_near_bottom_scrolls_with_generated_rows() {
+        let mut term = Terminal::with_scrollback(10, 4, 10);
+        term.feed(b"\x1b[4;1H");
+        let placement = image_placement(term.image_anchor(), 2);
+        term.add_image_placement(placement);
+
+        term.advance_after_image_rows(2);
+
+        let visible = term.snapshot().image_placements;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].anchor.row, 1);
+    }
+
+    #[test]
+    fn user_scrollback_reveals_image_that_left_current_viewport() {
+        let mut term = Terminal::with_scrollback(10, 3, 10);
+        term.add_image_placement(image_placement(term.image_anchor(), 1));
+        term.feed(b"\r\none\r\ntwo\r\nthree\r\nfour");
+        assert!(term.snapshot().image_placements.is_empty());
+
+        term.scroll_to_top();
+
+        assert_eq!(term.snapshot().image_placements.len(), 1);
+    }
+
+    #[test]
+    fn resize_keeps_image_cell_dimensions() {
+        let mut term = Terminal::new(10, 4);
+        let placement = image_placement(term.image_anchor(), 3);
+        term.add_image_placement(placement);
+
+        term.resize(20, 8);
+
+        let visible = term.snapshot().image_placements;
+        assert_eq!(visible[0].columns, placement.columns);
+        assert_eq!(visible[0].rows, placement.rows);
+    }
+
+    #[test]
+    fn terminal_reset_clears_image_placements() {
+        let mut term = Terminal::new(10, 4);
+        term.add_image_placement(image_placement(term.image_anchor(), 2));
+
+        term.feed(b"\x1bc");
+
+        assert!(term.snapshot().image_placements.is_empty());
+    }
+
     fn line_text(grid: &super::GridSnapshot, row: usize) -> String {
         (0..grid.cols)
             .map(|column| grid.cell(column, row).ch)
@@ -2736,6 +3097,18 @@ mod tests {
 
     fn point(col: usize, row: isize) -> SelectionPoint {
         SelectionPoint { col, row }
+    }
+
+    fn image_placement(anchor: GridPoint, rows: u16) -> ImagePlacement {
+        ImagePlacement {
+            placement_id: ImagePlacementId::new(1),
+            image_id: ImageId::new(1),
+            anchor,
+            columns: 2,
+            rows,
+            source_width: 2,
+            source_height: u32::from(rows),
+        }
     }
 
     fn mouse_event(kind: MouseEventKind, button: Option<MouseButton>) -> TerminalMouseEvent {

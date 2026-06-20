@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180">
+  <polygon id="cape_far" fill="#6C7086" points="134,68 116,64 82,78 40,112 64,136 108,128 132,102 144,74"/>
+  <polygon id="cape_main" fill="#6C7086" points="138,68 122,68 92,82 48,120 72,154 118,142 150,114 154,84 146,72"/>
+  <polygon id="cape_near" fill="#CDD6F4" points="144,70 134,78 120,98 112,130 144,146 182,132 198,98 158,76"/>
+  <polygon id="cape_lower" fill="#6C7086" points="136,92 118,112 94,146 122,166 158,156 174,126 148,96"/>
+  <polygon id="ribbon_far" fill="#6C7086" points="136,66 108,62 66,66 88,76 126,72"/>
+  <polygon id="ribbon_near" fill="#B4BEFE" points="146,72 180,70 222,78 204,90 160,82"/>
+</svg>

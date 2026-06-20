@@ -13,12 +13,16 @@ path = "src/main.rs"
 arboard = { version = "3", default-features = false }
 knightty_core = { package = "core", version = "0.1.0", path = "../core" }
 knightty_pty = { package = "pty", version = "0.1.0", path = "../pty" }
+knightty_proto = { package = "proto", version = "0.1.0", path = "../proto" }
 knightty_render = { package = "render", version = "0.1.0", path = "../render" }
+base64 = "0.22.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 open = "5.3.5"
 pollster = "0.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.18"
+toml = "0.9"
 url = "2.5.8"
 wgpu = "29.0.3"
 winit = "0.30.13"

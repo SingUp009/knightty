@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[dependencies]
+knightty_app = { package = "app", version = "0.1.0", path = "../app" }
+png = "0.18.1"
+roxmltree = "0.20.0"
+thiserror = "2.0.18"
+tiny-skia = "0.11.4"

@@ -1,36 +1,42 @@
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-mod config;
-
-use arboard::Clipboard;
-use config::{AppConfig, load_app_config, parse_wgpu_backend_name};
-use knightty_core::{
-    Damage, GridSnapshot, Hyperlink, MouseButton as TerminalMouseButton, MouseEventKind,
-    MouseProtocol, SelectionMode, SelectionPoint, Terminal, TerminalMouseEvent,
-};
+use app::config::{AppConfig, load_app_config, parse_wgpu_backend_name};
+use app::config_spec::default_config_toml;
+use app::graphics_diagnostics;
+use app::input::{InputRouter, RuntimeInputPorts};
+use knightty_core::{Damage, GridSnapshot};
 use knightty_pty::{PtySession, PtySize};
 use knightty_render::{
-    FontFamilyInfo, RenderError, RenderOptions, Renderer, RendererConfig, available_font_families,
+    CellMetrics, FontFamilyInfo, RenderError, RenderOptions, Renderer, RendererConfig,
+    WindowBackdrop, available_font_families,
 };
 use thiserror::Error;
-use url::Url;
 use wgpu::{Backends, Instance, InstanceDescriptor};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Cursor, CursorIcon, Window, WindowId};
+#[cfg(target_os = "windows")]
+use winit::platform::windows::{BackdropType, WindowExtWindows};
+use winit::window::{Window, WindowId};
+
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> Result<(), AppError> {
     match startup_action_from_args(std::env::args())? {
         StartupAction::RunApp => run_app(),
         StartupAction::ListFonts => {
             print_font_list(&available_font_families());
+            Ok(())
+        }
+        StartupAction::PrintDefaultConfig => {
+            print!("{}", default_config_toml());
             Ok(())
         }
     }
@@ -48,6 +54,7 @@ fn run_app() -> Result<(), AppError> {
 enum StartupAction {
     RunApp,
     ListFonts,
+    PrintDefaultConfig,
 }
 
 fn startup_action_from_args(
@@ -59,8 +66,11 @@ fn startup_action_from_args(
         return Ok(StartupAction::RunApp);
     };
 
-    if action == "+list-fonts" && args.next().is_none() {
+    let extra_arg = args.next();
+    if action == "+list-fonts" && extra_arg.is_none() {
         Ok(StartupAction::ListFonts)
+    } else if action == "+print-default-config" && extra_arg.is_none() {
+        Ok(StartupAction::PrintDefaultConfig)
     } else if action.starts_with('+') {
         Err(AppError::UnknownAction(action))
     } else {
@@ -92,49 +102,36 @@ struct Application {
     renderer_config: RendererConfig,
     proxy: EventLoopProxy<UserEvent>,
     window_state: Option<WindowState>,
-    terminal: Terminal,
+    input: InputRouter<RuntimeInputPorts>,
     pty: Option<PtySession>,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    modifiers: ModifiersState,
-    last_cursor_position: Option<PhysicalPosition<f64>>,
-    pressed_mouse_button: Option<TerminalMouseButton>,
-    selection_drag_active: bool,
-    selection_drag_anchor: Option<SelectionPoint>,
-    selection_drag_mode: Option<SelectionMode>,
-    selection_drag_moved: bool,
-    hovered_hyperlink: Option<HoveredHyperlink>,
-    pending_hyperlink_click: Option<PendingHyperlinkClick>,
-    hover_visual_dirty: bool,
-    current_cursor_icon: CursorIcon,
-    click_tracker: ClickTracker,
+    focused: bool,
+    cursor_blink_visible: bool,
+    cursor_blink_dirty: bool,
+    ime_cursor_area_active: bool,
+    last_cursor_blink: Instant,
+    last_config_check: Instant,
+    config_modified: Option<SystemTime>,
 }
 
 impl Application {
     fn new(proxy: EventLoopProxy<UserEvent>, config: AppConfig) -> Self {
         let renderer_config = config.renderer_config();
-        let initial_cols = config.initial_cols();
-        let initial_rows = config.initial_rows();
-        let scrollback_lines = config.scrollback_lines();
+        let input = InputRouter::new(config.clone(), RuntimeInputPorts::default());
+        let config_modified = config.source_path.as_deref().and_then(config_modified_time);
         Self {
             config,
             renderer_config,
             proxy,
             window_state: None,
-            terminal: Terminal::with_scrollback(initial_cols, initial_rows, scrollback_lines),
+            input,
             pty: None,
-            writer: None,
-            modifiers: ModifiersState::empty(),
-            last_cursor_position: None,
-            pressed_mouse_button: None,
-            selection_drag_active: false,
-            selection_drag_anchor: None,
-            selection_drag_mode: None,
-            selection_drag_moved: false,
-            hovered_hyperlink: None,
-            pending_hyperlink_click: None,
-            hover_visual_dirty: false,
-            current_cursor_icon: CursorIcon::Default,
-            click_tracker: ClickTracker::default(),
+            focused: true,
+            cursor_blink_visible: true,
+            cursor_blink_dirty: false,
+            ime_cursor_area_active: false,
+            last_cursor_blink: Instant::now(),
+            last_config_check: Instant::now(),
+            config_modified,
         }
     }
 
@@ -143,7 +140,7 @@ impl Application {
             return Ok(());
         }
 
-        let (cols, rows) = self.terminal.size();
+        let (cols, rows) = self.input.size();
         let size = pty_size_for_terminal(cols, rows, pixel_width, pixel_height);
         let shell = self.config.shell_command();
         let mut pty = PtySession::spawn_shell(size, shell.as_ref())?;
@@ -151,7 +148,7 @@ impl Application {
         let writer = Arc::new(Mutex::new(pty.take_writer()?));
         spawn_pty_reader(reader, self.proxy.clone());
 
-        self.writer = Some(writer);
+        self.input.ports_mut().set_writer(Some(writer));
         self.pty = Some(pty);
         Ok(())
     }
@@ -162,21 +159,72 @@ impl Application {
         }
     }
 
-    fn write_pty(&mut self, bytes: &[u8]) {
-        let Some(writer) = &self.writer else {
+    fn cursor_blink_enabled(&self) -> bool {
+        self.renderer_config.appearance.cursor.blink
+    }
+
+    fn reset_cursor_blink(&mut self) {
+        if !self.cursor_blink_enabled() {
+            return;
+        }
+        self.cursor_blink_visible = true;
+        self.cursor_blink_dirty = true;
+        self.last_cursor_blink = Instant::now();
+    }
+
+    fn reload_config_if_changed(&mut self) {
+        if self.last_config_check.elapsed() < CONFIG_RELOAD_INTERVAL {
+            return;
+        }
+        self.last_config_check = Instant::now();
+
+        let Some(path) = self.config.source_path.clone() else {
             return;
         };
+        let Some(modified) = config_modified_time(&path) else {
+            return;
+        };
+        if self.config_modified.is_some_and(|last| modified <= last) {
+            return;
+        }
 
-        if let Ok(mut writer) = writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        match load_app_config() {
+            Ok(config) => self.apply_reloaded_config(config, modified),
+            Err(error) => eprintln!("knightty config: reload failed: {error}"),
         }
     }
 
-    fn scroll_terminal_to_bottom(&mut self) {
-        if !matches!(self.terminal.scroll_to_bottom(), Damage::None) {
-            self.refresh_hover_hyperlink();
-            self.request_redraw();
+    fn reload_config_now(&mut self) {
+        match load_app_config() {
+            Ok(config) => {
+                let modified = config
+                    .source_path
+                    .as_deref()
+                    .and_then(config_modified_time)
+                    .unwrap_or_else(SystemTime::now);
+                self.apply_reloaded_config(config, modified);
+            }
+            Err(error) => eprintln!("knightty config: reload failed: {error}"),
+        }
+    }
+
+    fn apply_reloaded_config(&mut self, config: AppConfig, modified: SystemTime) {
+        let renderer_config = config.renderer_config();
+        self.config = config.clone();
+        self.renderer_config = renderer_config.clone();
+        self.config_modified = Some(modified);
+        self.input.update_config(config);
+
+        let window = self.window_state.as_ref().map(|state| state.window.clone());
+        if let Some(state) = &mut self.window_state {
+            state.renderer.update_config(renderer_config);
+        }
+        if let Some(window) = window {
+            apply_platform_appearance(&window, self.renderer_config.appearance.window);
+            let size = window.inner_size();
+            self.resize_terminal(size.width, size.height);
+            self.update_ime_cursor_area_from_current_snapshot();
+            window.request_redraw();
         }
     }
 
@@ -186,146 +234,32 @@ impl Application {
             .as_ref()
             .map(|state| state.renderer.cell_metrics())
             .unwrap_or(self.renderer_config.cell_metrics);
-        let cols = metrics.cols_for_width(width);
-        let rows = metrics.rows_for_height(height);
-        self.terminal.resize(cols, rows);
+        let window = self.renderer_config.appearance.window;
+        let usable_width = window.usable_width(width);
+        let usable_height = window.usable_height(height);
+        let cols = metrics.cols_for_width(usable_width);
+        let rows = metrics.rows_for_height(usable_height);
+        self.input.resize(cols, rows);
 
         if let Some(pty) = &mut self.pty {
-            let _ = pty.resize(pty_size_for_terminal(cols, rows, width, height));
+            let _ = pty.resize(pty_size_for_terminal(
+                cols,
+                rows,
+                usable_width,
+                usable_height,
+            ));
         }
     }
 
-    fn paste_from_clipboard(&mut self) {
-        let text = match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("knightty clipboard: paste failed: {error}");
-                return;
-            }
-        };
-        let bytes = self.terminal.paste_bytes(text.as_bytes());
-        self.write_user_input_to_pty(&bytes);
-    }
-
-    fn copy_selection_to_clipboard(&mut self) {
-        let Some(text) = self.terminal.selected_text() else {
-            return;
-        };
-
-        if let Err(error) = Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-            eprintln!("knightty clipboard: copy failed: {error}");
-        }
-    }
-
-    fn write_user_input_to_pty(&mut self, bytes: &[u8]) {
-        if self.terminal.has_selection() {
-            self.terminal.clear_selection();
-            self.update_cursor_icon();
-            self.request_redraw();
-        }
-
-        self.scroll_terminal_to_bottom();
-        self.write_pty(bytes);
-    }
-
-    fn clear_selection_if_left_click_outside_selection(&mut self) {
-        if !self.terminal.has_selection() {
-            return;
-        }
-
-        let outside_selection = self
-            .cursor_cell_position()
-            .is_none_or(|(col, row)| !self.terminal.selection_contains_visible_cell(col, row));
-        if outside_selection {
-            self.terminal.clear_selection();
-            self.update_cursor_icon();
-            self.request_redraw();
-        }
-    }
-
-    fn cursor_hyperlink(&self) -> Option<HoveredHyperlink> {
-        let cell = self.cursor_cell_position()?;
-        let hyperlink = self.terminal.hyperlink_at_cell(cell.0, cell.1)?;
-        Some(HoveredHyperlink { cell, hyperlink })
-    }
-
-    fn refresh_hover_hyperlink(&mut self) {
-        self.set_hovered_hyperlink(self.cursor_hyperlink());
-    }
-
-    fn clear_hover_hyperlink(&mut self) {
-        self.set_hovered_hyperlink(None);
-    }
-
-    fn set_hovered_hyperlink(&mut self, next: Option<HoveredHyperlink>) {
-        if self.hovered_hyperlink == next {
-            self.update_cursor_icon();
-            return;
-        }
-
-        self.hovered_hyperlink = next;
-        if self.config.hyperlink_underline_on_hover() {
-            self.hover_visual_dirty = true;
-            self.request_redraw();
-        }
-        self.update_cursor_icon();
-    }
-
-    fn update_cursor_icon(&mut self) {
-        let icon = hyperlink_cursor_icon(
-            self.hovered_hyperlink.is_some(),
-            self.terminal.has_selection(),
-        );
-        self.set_cursor_icon(icon);
-    }
-
-    fn set_cursor_icon(&mut self, icon: CursorIcon) {
-        if self.current_cursor_icon == icon {
-            return;
-        }
-        self.current_cursor_icon = icon;
-        if let Some(state) = &self.window_state {
-            state.window.set_cursor(Cursor::Icon(icon));
-        }
-    }
-
-    fn hovered_hyperlink_id_for_snapshot(&self, snapshot: &GridSnapshot) -> Option<usize> {
-        if !self.config.hyperlink_underline_on_hover() || self.terminal.has_selection() {
-            return None;
-        }
-
-        let hovered = self.hovered_hyperlink.as_ref()?;
-        if hovered.cell.0 >= snapshot.cols || hovered.cell.1 >= snapshot.rows {
-            return None;
-        }
-
-        let hyperlink_id = snapshot.cell(hovered.cell.0, hovered.cell.1).hyperlink?;
-        if snapshot.hyperlinks.get(hyperlink_id) == Some(&hovered.hyperlink) {
-            Some(hyperlink_id)
-        } else {
-            None
-        }
-    }
-
-    fn handle_hyperlink_open(&self, hyperlink: &Hyperlink) {
-        match allowed_hyperlink_url(&hyperlink.uri, self.config.hyperlink_allowed_schemes()) {
-            Ok(url) => open_url_in_background(url),
-            Err(error) => {
-                eprintln!("knightty hyperlink: rejected `{}`: {error}", hyperlink.uri);
-            }
-        }
-    }
-
-    fn cursor_cell_position(&self) -> Option<(usize, usize)> {
-        let position = self.last_cursor_position?;
+    fn cursor_cell_for_position(&self, position: PhysicalPosition<f64>) -> Option<(usize, usize)> {
         let state = self.window_state.as_ref()?;
         let metrics = state.renderer.cell_metrics();
-        let (cols, rows) = self.terminal.size();
+        let (cols, rows) = self.input.size();
         cell_position_for_pixel(CellHitTest {
             pixel_x: position.x,
             pixel_y: position.y,
-            origin_x: 0.0,
-            origin_y: 0.0,
+            origin_x: f64::from(self.renderer_config.appearance.window.padding_x),
+            origin_y: f64::from(self.renderer_config.appearance.window.padding_y),
             cell_width: metrics.width,
             cell_height: metrics.height,
             cols,
@@ -333,231 +267,32 @@ impl Application {
         })
     }
 
-    fn cursor_selection_point(&self) -> Option<SelectionPoint> {
-        let (col, row) = self.cursor_cell_position()?;
-        self.terminal.selection_point_for_visible_cell(col, row)
+    fn update_ime_cursor_area_from_current_snapshot(&self) {
+        if !self.ime_cursor_area_active {
+            return;
+        }
+        let snapshot = self.input.snapshot();
+        self.update_ime_cursor_area(&snapshot);
     }
 
-    fn terminal_mouse_event(
-        &self,
-        kind: MouseEventKind,
-        button: Option<TerminalMouseButton>,
-    ) -> Option<TerminalMouseEvent> {
-        let (col, row) = self.cursor_cell_position()?;
-        Some(TerminalMouseEvent {
-            kind,
-            button,
-            col,
-            row,
-            shift: self.modifiers.shift_key(),
-            alt: self.modifiers.alt_key(),
-            ctrl: self.modifiers.control_key(),
-        })
-    }
-
-    fn write_mouse_event(&mut self, kind: MouseEventKind, button: Option<TerminalMouseButton>) {
-        let Some(event) = self.terminal_mouse_event(kind, button) else {
+    fn update_ime_cursor_area(&self, snapshot: &GridSnapshot) {
+        if !self.ime_cursor_area_active {
+            return;
+        }
+        let Some(state) = self.window_state.as_ref() else {
             return;
         };
-        let Some(bytes) = self.terminal.encode_mouse_event(event) else {
+        let metrics = state.renderer.cell_metrics();
+        let window = self.renderer_config.appearance.window;
+        let Some(area) =
+            ime_cursor_area_for_snapshot(snapshot, metrics, window.padding_x, window.padding_y)
+        else {
             return;
         };
-        self.write_pty(&bytes);
-    }
-
-    fn handle_mouse_input(&mut self, state: ElementState, button: WinitMouseButton) {
-        let terminal_button = terminal_mouse_button(button);
-        match state {
-            ElementState::Pressed => {
-                self.pending_hyperlink_click = None;
-                if terminal_button == Some(TerminalMouseButton::Left) {
-                    let hovered = self.cursor_hyperlink();
-                    if route_hyperlink_click(HyperlinkClickInput {
-                        left_button: true,
-                        ctrl_pressed: self.modifiers.control_key(),
-                        open_enabled: self.config.hyperlink_open_enabled(),
-                        has_hyperlink: hovered.is_some(),
-                        selection_drag_active: self.selection_drag_active,
-                        selection_active: self.terminal.has_selection(),
-                        mouse_reporting_enabled: self.terminal.mouse_modes().protocol
-                            != MouseProtocol::Off,
-                    }) != HyperlinkClickRouting::ExistingMouseRouting
-                    {
-                        self.pressed_mouse_button = None;
-                        self.selection_drag_active = false;
-                        self.selection_drag_anchor = None;
-                        self.selection_drag_mode = None;
-                        self.selection_drag_moved = false;
-                        self.pending_hyperlink_click =
-                            hovered.map(|hovered| PendingHyperlinkClick { hovered });
-                        return;
-                    }
-                    self.clear_selection_if_left_click_outside_selection();
-                }
-
-                self.pressed_mouse_button = terminal_button;
-                if terminal_button == Some(TerminalMouseButton::Left)
-                    && route_mouse_drag(
-                        self.terminal.mouse_modes().protocol != MouseProtocol::Off,
-                        self.modifiers.shift_key(),
-                    ) == MouseDragRouting::Selection
-                {
-                    let Some(point) = self.cursor_selection_point() else {
-                        self.pressed_mouse_button = None;
-                        return;
-                    };
-                    let mode = self.click_tracker.record_click(point, Instant::now());
-                    self.selection_drag_active = true;
-                    self.selection_drag_anchor = Some(point);
-                    self.selection_drag_mode = Some(mode);
-                    self.selection_drag_moved = false;
-                    self.terminal.begin_selection(point, mode);
-                    self.update_cursor_icon();
-                    self.request_redraw();
-                    return;
-                }
-
-                self.selection_drag_active = false;
-                self.write_mouse_event(MouseEventKind::Press, terminal_button);
-            }
-            ElementState::Released => {
-                if terminal_button == Some(TerminalMouseButton::Left)
-                    && let Some(pending) = self.pending_hyperlink_click.take()
-                {
-                    self.pressed_mouse_button = None;
-                    let current = self.cursor_hyperlink();
-                    if should_open_pending_hyperlink(
-                        &pending,
-                        current.as_ref(),
-                        self.selection_drag_active,
-                        self.terminal.has_selection(),
-                    ) {
-                        self.handle_hyperlink_open(&pending.hovered.hyperlink);
-                    }
-                    return;
-                }
-
-                if self.selection_drag_active && terminal_button == Some(TerminalMouseButton::Left)
-                {
-                    let release_point = self.cursor_selection_point();
-                    if let Some(point) = release_point {
-                        if self.selection_drag_anchor != Some(point) {
-                            self.selection_drag_moved = true;
-                        }
-                        self.terminal.update_selection(point);
-                    }
-                    let clear_simple_click = should_clear_simple_click_selection(
-                        self.selection_drag_anchor,
-                        release_point.or(self.selection_drag_anchor),
-                        self.selection_drag_mode.unwrap_or(SelectionMode::Simple),
-                        self.selection_drag_moved,
-                    );
-                    self.terminal.end_selection();
-                    if clear_simple_click {
-                        self.terminal.clear_selection();
-                    }
-                    self.selection_drag_active = false;
-                    self.selection_drag_anchor = None;
-                    self.selection_drag_mode = None;
-                    self.selection_drag_moved = false;
-                    self.pressed_mouse_button = None;
-                    self.refresh_hover_hyperlink();
-                    self.request_redraw();
-                    return;
-                }
-
-                self.write_mouse_event(
-                    MouseEventKind::Release,
-                    terminal_button.or(self.pressed_mouse_button),
-                );
-                if terminal_button == self.pressed_mouse_button || terminal_button.is_none() {
-                    self.pressed_mouse_button = None;
-                }
-            }
-        }
-    }
-
-    fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
-        self.last_cursor_position = Some(position);
-        if self.selection_drag_active {
-            self.clear_hover_hyperlink();
-            if let Some(point) = self.cursor_selection_point() {
-                if self.selection_drag_anchor != Some(point) {
-                    self.selection_drag_moved = true;
-                }
-                self.terminal.update_selection(point);
-                self.request_redraw();
-            }
-            return;
-        }
-
-        let current_hyperlink = self.cursor_hyperlink();
-        if let Some(pending) = &self.pending_hyperlink_click
-            && current_hyperlink.as_ref() != Some(&pending.hovered)
-        {
-            self.pending_hyperlink_click = None;
-        }
-        self.set_hovered_hyperlink(current_hyperlink);
-
-        if self.pending_hyperlink_click.is_some() {
-            return;
-        }
-
-        let (kind, button) = if self.pressed_mouse_button.is_some() {
-            (MouseEventKind::Drag, self.pressed_mouse_button)
-        } else {
-            (MouseEventKind::Move, None)
-        };
-        self.write_mouse_event(kind, button);
-    }
-
-    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.selection_drag_active {
-            return;
-        }
-
-        match route_mouse_wheel(
-            self.terminal.alternate_screen_enabled(),
-            self.terminal.mouse_modes().protocol != MouseProtocol::Off,
-            delta,
-            self.config.scroll_multiplier(),
-        ) {
-            WheelRouting::PtyMouse(button) => {
-                self.write_mouse_event(MouseEventKind::Wheel, Some(button));
-            }
-            WheelRouting::Scrollback { direction, lines } => {
-                let damage = match direction {
-                    ScrollDirection::Up => self.terminal.scroll_up_lines(lines),
-                    ScrollDirection::Down => self.terminal.scroll_down_lines(lines),
-                };
-                if !matches!(damage, Damage::None) {
-                    self.refresh_hover_hyperlink();
-                    self.request_redraw();
-                }
-            }
-            WheelRouting::Noop => {}
-        }
-    }
-
-    fn handle_scroll_shortcut(&mut self, action: ScrollShortcut) {
-        let rows = self.terminal.size().1;
-        let damage = match action {
-            ScrollShortcut::PageUp => self.terminal.scroll_up_lines(rows),
-            ScrollShortcut::PageDown => self.terminal.scroll_down_lines(rows),
-            ScrollShortcut::Top => self.terminal.scroll_to_top(),
-            ScrollShortcut::Bottom => self.terminal.scroll_to_bottom(),
-        };
-        if !matches!(damage, Damage::None) {
-            self.refresh_hover_hyperlink();
-            self.request_redraw();
-        }
-    }
-
-    fn handle_focus_event(&mut self, focused: bool) {
-        let Some(bytes) = self.terminal.encode_focus_event(focused) else {
-            return;
-        };
-        self.write_pty(&bytes);
+        state.window.set_ime_cursor_area(
+            PhysicalPosition::new(area.x, area.y),
+            PhysicalSize::new(area.width, area.height),
+        );
     }
 }
 
@@ -567,23 +302,29 @@ impl ApplicationHandler<UserEvent> for Application {
             return;
         }
 
+        let window_appearance = self.renderer_config.appearance.window;
+        let initial_width = self.config.initial_cols() as u32
+            * self.renderer_config.cell_metrics.width
+            + window_appearance.padding_x.saturating_mul(2);
+        let initial_height = self.config.initial_rows() as u32
+            * self.renderer_config.cell_metrics.height
+            + window_appearance.padding_y.saturating_mul(2);
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
                         .with_title("knightty")
                         .with_inner_size(LogicalSize::new(
-                            (self.config.initial_cols() as u32
-                                * self.renderer_config.cell_metrics.width)
-                                as f64,
-                            (self.config.initial_rows() as u32
-                                * self.renderer_config.cell_metrics.height)
-                                as f64,
-                        )),
+                            initial_width as f64,
+                            initial_height as f64,
+                        ))
+                        .with_transparent(window_appearance.opacity < 1.0),
                 )
                 .expect("create window"),
         );
         let size = window.inner_size();
+        window.set_ime_allowed(true);
+        apply_platform_appearance(&window, window_appearance);
         let mut instance_descriptor = InstanceDescriptor::new_with_display_handle(Box::new(
             event_loop.owned_display_handle(),
         ));
@@ -626,18 +367,16 @@ impl ApplicationHandler<UserEvent> for Application {
             window: window.clone(),
             renderer,
         });
+        self.input.ports_mut().set_window(Some(window.clone()));
         window.request_redraw();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyBytes(bytes) => {
-                self.terminal.feed(&bytes);
-                for response in self.terminal.take_pty_writes() {
-                    self.write_pty(response.as_bytes());
-                }
-                self.refresh_hover_hyperlink();
-                let window_title = self.terminal.take_window_title_changed();
+                self.reset_cursor_blink();
+                let window_title = self.input.feed_pty_bytes(&bytes);
+                self.update_ime_cursor_area_from_current_snapshot();
                 if let Some(state) = &self.window_state {
                     if let Some(title) = window_title {
                         state.window.set_title(&format_window_title(&title));
@@ -646,6 +385,7 @@ impl ApplicationHandler<UserEvent> for Application {
                 }
             }
             UserEvent::PtyExited => {
+                self.input.clear_ime_preedit();
                 if let Some(state) = &self.window_state {
                     state.window.request_redraw();
                 }
@@ -662,70 +402,94 @@ impl ApplicationHandler<UserEvent> for Application {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers.state();
+                self.input.set_modifiers(modifiers.state());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    if let Some(action) =
-                        scroll_shortcut_for_key(&event.logical_key, self.modifiers)
-                    {
-                        self.handle_scroll_shortcut(action);
-                        return;
+                    self.reset_cursor_blink();
+                    self.input
+                        .handle_key_pressed(&event.logical_key, event.text.as_deref());
+                    if self.input.take_config_reload_request() {
+                        self.reload_config_now();
                     }
-                    if is_copy_shortcut(&event.logical_key, self.modifiers) {
-                        self.copy_selection_to_clipboard();
-                        return;
-                    }
-                    if is_paste_shortcut(&event.logical_key, self.modifiers) {
-                        self.paste_from_clipboard();
-                        return;
-                    }
-                    if let Some(bytes) =
-                        input_bytes(&event.logical_key, event.text.as_deref(), self.modifiers)
-                    {
-                        self.write_user_input_to_pty(&bytes);
-                    }
+                    self.update_ime_cursor_area_from_current_snapshot();
+                    self.request_redraw();
                 }
             }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.reset_cursor_blink();
+                self.input.handle_ime_commit(&text);
+                self.update_ime_cursor_area_from_current_snapshot();
+                self.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Preedit(text, cursor_range)) => {
+                let cursor_range = cursor_range.map(|(start, end)| start..end);
+                self.input.handle_ime_preedit(text, cursor_range);
+                self.update_ime_cursor_area_from_current_snapshot();
+                self.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Enabled) => {
+                self.ime_cursor_area_active = true;
+                self.update_ime_cursor_area_from_current_snapshot();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.ime_cursor_area_active = false;
+                self.input.clear_ime_preedit();
+                self.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                self.handle_cursor_moved(position);
+                let cell = self.cursor_cell_for_position(position);
+                self.input.handle_cursor_moved(cell);
+                self.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
-                self.last_cursor_position = None;
-                self.pending_hyperlink_click = None;
-                self.clear_hover_hyperlink();
+                self.input.handle_cursor_left();
+                self.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.handle_mouse_input(state, button);
+                self.input.handle_mouse_input(state, button);
+                self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.handle_mouse_wheel(delta);
+                self.input.handle_mouse_wheel(delta);
+                self.update_ime_cursor_area_from_current_snapshot();
+                self.request_redraw();
             }
             WindowEvent::Focused(focused) => {
-                self.handle_focus_event(focused);
+                self.focused = focused;
+                self.input.handle_focus_event(focused);
+                self.update_ime_cursor_area_from_current_snapshot();
+                self.request_redraw();
             }
             WindowEvent::Resized(size) => {
                 self.resize_terminal(size.width, size.height);
-                self.refresh_hover_hyperlink();
+                self.input.refresh_hover_hyperlink();
                 if let Some(state) = &mut self.window_state {
                     state.renderer.resize(size.width, size.height);
                     state.window.request_redraw();
                 }
+                self.update_ime_cursor_area_from_current_snapshot();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.update_ime_cursor_area_from_current_snapshot();
             }
             WindowEvent::RedrawRequested => {
-                let snapshot = self.terminal.snapshot();
-                let hovered_hyperlink_id = self.hovered_hyperlink_id_for_snapshot(&snapshot);
-                let hover_visual_dirty = self.hover_visual_dirty;
-                let damage = if hover_visual_dirty {
-                    let _ = self.terminal.take_damage();
-                    Damage::Full
-                } else {
-                    self.terminal.take_damage()
-                };
-                if matches!(damage, Damage::None) {
+                let snapshot = self.input.snapshot();
+                let inline_images = self.input.inline_images_for_snapshot(&snapshot);
+                self.update_ime_cursor_area(&snapshot);
+                let hovered_hyperlink_id = self.input.hovered_hyperlink_id_for_snapshot(&snapshot);
+                let search_query = self.input.search_query_for_render();
+                let ime_preedit = self.input.ime_preedit_for_render();
+                let (search_matches, current_search_match) =
+                    self.input.search_matches_for_snapshot(&snapshot);
+                let blink_dirty = self.cursor_blink_dirty;
+                let mut damage = self.input.take_render_damage();
+                if matches!(damage, Damage::None) && !blink_dirty {
                     return;
                 }
-                self.hover_visual_dirty = false;
+                if matches!(damage, Damage::None) {
+                    damage = Damage::Full;
+                }
 
                 if let Some(state) = &mut self.window_state {
                     match state.renderer.render(
@@ -733,9 +497,18 @@ impl ApplicationHandler<UserEvent> for Application {
                         &damage,
                         RenderOptions {
                             hovered_hyperlink_id,
+                            search_matches,
+                            current_search_match,
+                            search_query,
+                            cursor_blink_visible: self.cursor_blink_visible,
+                            focused: self.focused,
+                            ime_preedit,
+                            inline_images,
                         },
                     ) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            self.cursor_blink_dirty = false;
+                        }
                         Err(RenderError::SurfaceLost) => {
                             if state
                                 .renderer
@@ -758,6 +531,26 @@ impl ApplicationHandler<UserEvent> for Application {
             _ => {}
         }
     }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.reload_config_if_changed();
+
+        if !self.cursor_blink_enabled() || self.last_cursor_blink.elapsed() < CURSOR_BLINK_INTERVAL
+        {
+            return;
+        }
+
+        self.cursor_blink_visible = !self.cursor_blink_visible;
+        self.cursor_blink_dirty = true;
+        self.last_cursor_blink = Instant::now();
+        self.request_redraw();
+    }
+}
+
+fn config_modified_time(path: &std::path::Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 struct WindowState {
@@ -765,237 +558,74 @@ struct WindowState {
     renderer: Renderer,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HoveredHyperlink {
-    cell: (usize, usize),
-    hyperlink: Hyperlink,
+trait PlatformAppearance {
+    fn set_window_opacity(&self, opacity: f32);
+    fn set_blur(&self, enabled: bool, radius: u32) -> Result<(), AppearanceError>;
+    fn set_backdrop(&self, backdrop: WindowBackdrop) -> Result<(), AppearanceError>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingHyperlinkClick {
-    hovered: HoveredHyperlink,
+struct WinitPlatformAppearance<'a> {
+    window: &'a Window,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct HyperlinkClickInput {
-    left_button: bool,
-    ctrl_pressed: bool,
-    open_enabled: bool,
-    has_hyperlink: bool,
-    selection_drag_active: bool,
-    selection_active: bool,
-    mouse_reporting_enabled: bool,
-}
+impl PlatformAppearance for WinitPlatformAppearance<'_> {
+    fn set_window_opacity(&self, opacity: f32) {
+        self.window.set_transparent(opacity < 1.0);
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HyperlinkClickRouting {
-    PendingOpen { mouse_reporting_overridden: bool },
-    ExistingMouseRouting,
-}
+    fn set_blur(&self, enabled: bool, _radius: u32) -> Result<(), AppearanceError> {
+        self.window.set_blur(enabled);
+        Ok(())
+    }
 
-fn route_hyperlink_click(input: HyperlinkClickInput) -> HyperlinkClickRouting {
-    let HyperlinkClickInput {
-        left_button,
-        ctrl_pressed,
-        open_enabled,
-        has_hyperlink,
-        selection_drag_active,
-        selection_active,
-        mouse_reporting_enabled,
-    } = input;
-
-    if left_button
-        && ctrl_pressed
-        && open_enabled
-        && has_hyperlink
-        && !selection_drag_active
-        && !selection_active
-    {
-        HyperlinkClickRouting::PendingOpen {
-            mouse_reporting_overridden: mouse_reporting_enabled,
-        }
-    } else {
-        HyperlinkClickRouting::ExistingMouseRouting
+    fn set_backdrop(&self, backdrop: WindowBackdrop) -> Result<(), AppearanceError> {
+        set_platform_backdrop(self.window, backdrop)
     }
 }
 
-fn should_open_pending_hyperlink(
-    pending: &PendingHyperlinkClick,
-    current: Option<&HoveredHyperlink>,
-    selection_drag_active: bool,
-    selection_active: bool,
-) -> bool {
-    !selection_drag_active && !selection_active && current == Some(&pending.hovered)
+#[cfg(target_os = "windows")]
+fn set_platform_backdrop(window: &Window, backdrop: WindowBackdrop) -> Result<(), AppearanceError> {
+    let backdrop_type = match backdrop {
+        WindowBackdrop::None => BackdropType::None,
+        WindowBackdrop::Acrylic => BackdropType::TransientWindow,
+        WindowBackdrop::Mica => BackdropType::MainWindow,
+        WindowBackdrop::Tabbed => BackdropType::TabbedWindow,
+    };
+    window.set_system_backdrop(backdrop_type);
+    Ok(())
 }
 
-fn should_clear_simple_click_selection(
-    anchor: Option<SelectionPoint>,
-    focus: Option<SelectionPoint>,
-    mode: SelectionMode,
-    moved: bool,
-) -> bool {
-    matches!(mode, SelectionMode::Simple) && !moved && anchor.is_some() && anchor == focus
-}
-
-fn hyperlink_cursor_icon(has_hover: bool, selection_active: bool) -> CursorIcon {
-    if has_hover && !selection_active {
-        CursorIcon::Pointer
-    } else {
-        CursorIcon::Default
+#[cfg(not(target_os = "windows"))]
+fn set_platform_backdrop(
+    _window: &Window,
+    backdrop: WindowBackdrop,
+) -> Result<(), AppearanceError> {
+    match backdrop {
+        WindowBackdrop::None => Ok(()),
+        _ => Err(AppearanceError::UnsupportedBackdrop(backdrop)),
     }
 }
 
-fn allowed_hyperlink_url(
-    uri: &str,
-    allowed_schemes: &[String],
-) -> Result<String, HyperlinkUrlError> {
-    if allowed_schemes.is_empty() {
-        return Err(HyperlinkUrlError::NoAllowedSchemes);
-    }
+fn apply_platform_appearance(window: &Window, appearance: knightty_render::WindowAppearance) {
+    let platform = WinitPlatformAppearance { window };
+    platform.set_window_opacity(appearance.opacity);
 
-    let parsed = Url::parse(uri).map_err(|_| HyperlinkUrlError::InvalidUrl)?;
-    let scheme = parsed.scheme().to_ascii_lowercase();
-    if allowed_schemes.iter().any(|allowed| allowed == &scheme) {
-        Ok(parsed.to_string())
-    } else {
-        Err(HyperlinkUrlError::DisallowedScheme(scheme))
+    let blur_enabled = appearance.blur && appearance.opacity < 1.0;
+    if let Err(error) = platform.set_blur(blur_enabled, appearance.blur_radius) {
+        eprintln!("knightty appearance: warning: {error}");
+    }
+    if let Err(error) = platform.set_backdrop(appearance.backdrop) {
+        eprintln!("knightty appearance: warning: {error}");
     }
 }
 
-fn open_url_in_background(url: String) {
-    let _ = thread::spawn(move || {
-        if let Err(error) = open::that(&url) {
-            eprintln!("knightty hyperlink: failed to open `{url}`: {error}");
-        }
-    });
-}
-
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-enum HyperlinkUrlError {
-    #[error("no URL schemes are allowed")]
-    NoAllowedSchemes,
-    #[error("invalid URL")]
-    InvalidUrl,
-    #[error("scheme `{0}` is not allowed")]
-    DisallowedScheme(String),
-}
-
-fn input_bytes(key: &Key, text: Option<&str>, modifiers: ModifiersState) -> Option<Vec<u8>> {
-    if modifiers.control_key() {
-        match key {
-            Key::Character(value) if value.eq_ignore_ascii_case("c") => {
-                return Some(b"\x03".to_vec());
-            }
-            _ => {}
-        }
-    }
-
-    match key {
-        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
-        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-        _ => text
-            .filter(|value| !value.is_empty() && !modifiers.control_key() && !modifiers.super_key())
-            .map(|value| value.as_bytes().to_vec()),
-    }
-}
-
-fn is_paste_shortcut(key: &Key, modifiers: ModifiersState) -> bool {
-    let plain_terminal_modifier =
-        !modifiers.alt_key() && !modifiers.super_key() && modifiers.shift_key();
-    let ctrl_shift_v = plain_terminal_modifier
-        && modifiers.control_key()
-        && matches!(key, Key::Character(value) if value.eq_ignore_ascii_case("v"));
-    let shift_insert = plain_terminal_modifier
-        && !modifiers.control_key()
-        && matches!(key, Key::Named(NamedKey::Insert));
-
-    ctrl_shift_v || shift_insert
-}
-
-fn is_copy_shortcut(key: &Key, modifiers: ModifiersState) -> bool {
-    modifiers.control_key()
-        && modifiers.shift_key()
-        && !modifiers.alt_key()
-        && !modifiers.super_key()
-        && matches!(key, Key::Character(value) if value.eq_ignore_ascii_case("c"))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MouseDragRouting {
-    Selection,
-    Pty,
-}
-
-fn route_mouse_drag(mouse_reporting_enabled: bool, shift_pressed: bool) -> MouseDragRouting {
-    if shift_pressed || !mouse_reporting_enabled {
-        MouseDragRouting::Selection
-    } else {
-        MouseDragRouting::Pty
-    }
-}
-
-const MULTI_CLICK_MAX_DELAY: Duration = Duration::from_millis(500);
-
-#[derive(Clone, Debug, Default)]
-struct ClickTracker {
-    last_point: Option<SelectionPoint>,
-    last_at: Option<Instant>,
-    count: u8,
-}
-
-impl ClickTracker {
-    fn record_click(&mut self, point: SelectionPoint, now: Instant) -> SelectionMode {
-        let within_multi_click = self.last_point == Some(point)
-            && self
-                .last_at
-                .and_then(|last| now.checked_duration_since(last))
-                .is_some_and(|elapsed| elapsed <= MULTI_CLICK_MAX_DELAY);
-
-        self.count = if within_multi_click && self.count < 3 {
-            self.count + 1
-        } else {
-            1
-        };
-        self.last_point = Some(point);
-        self.last_at = Some(now);
-
-        match self.count {
-            2 => SelectionMode::Word,
-            3 => SelectionMode::Line,
-            _ => SelectionMode::Simple,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScrollShortcut {
-    PageUp,
-    PageDown,
-    Top,
-    Bottom,
-}
-
-fn scroll_shortcut_for_key(key: &Key, modifiers: ModifiersState) -> Option<ScrollShortcut> {
-    if !modifiers.control_key()
-        || !modifiers.shift_key()
-        || modifiers.alt_key()
-        || modifiers.super_key()
-    {
-        return None;
-    }
-
-    match key {
-        Key::Named(NamedKey::PageUp) => Some(ScrollShortcut::PageUp),
-        Key::Named(NamedKey::PageDown) => Some(ScrollShortcut::PageDown),
-        Key::Named(NamedKey::Home) => Some(ScrollShortcut::Top),
-        Key::Named(NamedKey::End) => Some(ScrollShortcut::Bottom),
-        _ => None,
-    }
+#[derive(Debug, Error)]
+enum AppearanceError {
+    #[error(
+        "window backdrop `{0}` is not supported by the current platform backend; continuing without it"
+    )]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    UnsupportedBackdrop(WindowBackdrop),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1008,6 +638,14 @@ struct CellHitTest {
     cell_height: u32,
     cols: usize,
     rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImeCursorArea {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 fn cell_position_for_pixel(hit: CellHitTest) -> Option<(usize, usize)> {
@@ -1034,87 +672,22 @@ fn cell_position_for_pixel(hit: CellHitTest) -> Option<(usize, usize)> {
     Some((col, row))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScrollDirection {
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WheelRouting {
-    PtyMouse(TerminalMouseButton),
-    Scrollback {
-        direction: ScrollDirection,
-        lines: usize,
-    },
-    Noop,
-}
-
-fn route_mouse_wheel(
-    alternate_screen_enabled: bool,
-    mouse_reporting_enabled: bool,
-    delta: MouseScrollDelta,
-    scroll_multiplier: usize,
-) -> WheelRouting {
-    let Some(direction) = wheel_direction(delta) else {
-        return WheelRouting::Noop;
-    };
-
-    if mouse_reporting_enabled {
-        return WheelRouting::PtyMouse(direction.wheel_button());
+fn ime_cursor_area_for_snapshot(
+    snapshot: &GridSnapshot,
+    metrics: CellMetrics,
+    padding_x: u32,
+    padding_y: u32,
+) -> Option<ImeCursorArea> {
+    if !snapshot.cursor.visible {
+        return None;
     }
 
-    if alternate_screen_enabled {
-        return WheelRouting::Noop;
-    }
-
-    WheelRouting::Scrollback {
-        direction,
-        lines: wheel_scroll_lines(delta, scroll_multiplier),
-    }
-}
-
-fn terminal_mouse_button(button: WinitMouseButton) -> Option<TerminalMouseButton> {
-    match button {
-        WinitMouseButton::Left => Some(TerminalMouseButton::Left),
-        WinitMouseButton::Middle => Some(TerminalMouseButton::Middle),
-        WinitMouseButton::Right => Some(TerminalMouseButton::Right),
-        WinitMouseButton::Back => Some(TerminalMouseButton::Other(3)),
-        WinitMouseButton::Forward => Some(TerminalMouseButton::Other(4)),
-        WinitMouseButton::Other(code) => u8::try_from(code).ok().map(TerminalMouseButton::Other),
-    }
-}
-
-fn wheel_direction(delta: MouseScrollDelta) -> Option<ScrollDirection> {
-    let y = match delta {
-        MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-        MouseScrollDelta::PixelDelta(position) => position.y,
-    };
-
-    if y > 0.0 {
-        Some(ScrollDirection::Up)
-    } else if y < 0.0 {
-        Some(ScrollDirection::Down)
-    } else {
-        None
-    }
-}
-
-impl ScrollDirection {
-    fn wheel_button(self) -> TerminalMouseButton {
-        match self {
-            Self::Up => TerminalMouseButton::WheelUp,
-            Self::Down => TerminalMouseButton::WheelDown,
-        }
-    }
-}
-
-fn wheel_scroll_lines(delta: MouseScrollDelta, scroll_multiplier: usize) -> usize {
-    let delta_lines = match delta {
-        MouseScrollDelta::LineDelta(_, y) => y.abs().ceil().max(1.0) as usize,
-        MouseScrollDelta::PixelDelta(_) => 1,
-    };
-    delta_lines.saturating_mul(scroll_multiplier.max(1))
+    Some(ImeCursorArea {
+        x: padding_x.saturating_add((snapshot.cursor.x as u32).saturating_mul(metrics.width)),
+        y: padding_y.saturating_add((snapshot.cursor.y as u32).saturating_mul(metrics.height)),
+        width: metrics.width,
+        height: metrics.height,
+    })
 }
 
 fn spawn_pty_reader(mut reader: Box<dyn Read + Send>, proxy: EventLoopProxy<UserEvent>) {
@@ -1127,6 +700,7 @@ fn spawn_pty_reader(mut reader: Box<dyn Read + Send>, proxy: EventLoopProxy<User
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
+                    graphics_diagnostics::record_pty_read(&buffer[..read]);
                     if sender.send(buffer[..read].to_vec()).is_err() {
                         break;
                     }
@@ -1207,32 +781,37 @@ enum AppError {
     #[error("PTY failed: {0}")]
     Pty(#[from] knightty_pty::PtyError),
     #[error("config failed: {0}")]
-    Config(#[from] config::ConfigError),
+    Config(#[from] app::config::ConfigError),
     #[error("invalid wgpu backend `{0}`; expected auto, vulkan, dx12, or gl")]
     InvalidWgpuBackend(String),
-    #[error("unknown action `{0}`; expected +list-fonts")]
+    #[error("unknown action `{0}`; expected +list-fonts or +print-default-config")]
     UnknownAction(String),
-    #[error("unexpected argument `{0}`; run without arguments or use +list-fonts")]
+    #[error(
+        "unexpected argument `{0}`; run without arguments or use +list-fonts or +print-default-config"
+    )]
     UnexpectedArgument(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CellHitTest, ClickTracker, HoveredHyperlink, HyperlinkClickInput, HyperlinkClickRouting,
+        CellHitTest, ImeCursorArea, cell_position_for_pixel, format_font_list, format_window_title,
+        ime_cursor_area_for_snapshot, pty_size_for_terminal,
+    };
+    use app::input::{
+        ClickTracker, HoveredHyperlink, HyperlinkClickInput, HyperlinkClickRouting,
         HyperlinkUrlError, MouseDragRouting, PendingHyperlinkClick, ScrollDirection,
-        ScrollShortcut, WheelRouting, allowed_hyperlink_url, cell_position_for_pixel,
-        format_font_list, format_window_title, hyperlink_cursor_icon, is_copy_shortcut,
-        is_paste_shortcut, pty_size_for_terminal, route_hyperlink_click, route_mouse_drag,
+        ScrollShortcut, WheelRouting, allowed_hyperlink_url, hyperlink_cursor_icon,
+        is_copy_shortcut, is_paste_shortcut, route_hyperlink_click, route_mouse_drag,
         route_mouse_wheel, scroll_shortcut_for_key, should_clear_simple_click_selection,
         should_open_pending_hyperlink,
     };
     use std::time::{Duration, Instant};
 
     use knightty_core::{
-        Hyperlink, MouseButton as TerminalMouseButton, SelectionMode, SelectionPoint,
+        Hyperlink, MouseButton as TerminalMouseButton, SelectionMode, SelectionPoint, Terminal,
     };
-    use knightty_render::FontFamilyInfo;
+    use knightty_render::{CellMetrics, FontFamilyInfo};
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseScrollDelta;
     use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -1251,6 +830,17 @@ mod tests {
             super::startup_action_from_args(["knightty", "+list-fonts"].map(str::to_owned))
                 .unwrap(),
             super::StartupAction::ListFonts
+        );
+    }
+
+    #[test]
+    fn startup_action_accepts_print_default_config() {
+        assert_eq!(
+            super::startup_action_from_args(
+                ["knightty", "+print-default-config"].map(str::to_owned)
+            )
+            .unwrap(),
+            super::StartupAction::PrintDefaultConfig
         );
     }
 
@@ -1319,6 +909,39 @@ mod tests {
         assert_eq!(cell_position_for_pixel(hit(720.0, 36.0, 0.0, 0.0)), None);
         assert_eq!(cell_position_for_pixel(hit(18.0, 432.0, 0.0, 0.0)), None);
         assert_eq!(cell_position_for_pixel(hit(4.0, 36.0, 5.0, 0.0)), None);
+    }
+
+    #[test]
+    fn ime_cursor_area_uses_visible_cursor_metrics_and_padding() {
+        let mut terminal = Terminal::new(10, 5);
+        terminal.feed(b"\x1b[3;4H");
+        let metrics = CellMetrics {
+            width: 11,
+            height: 23,
+            font_size: 16.0,
+            line_height: 23.0,
+        };
+
+        assert_eq!(
+            ime_cursor_area_for_snapshot(&terminal.snapshot(), metrics, 5, 7),
+            Some(ImeCursorArea {
+                x: 38,
+                y: 53,
+                width: 11,
+                height: 23,
+            })
+        );
+    }
+
+    #[test]
+    fn ime_cursor_area_is_none_when_cursor_is_hidden() {
+        let mut terminal = Terminal::new(10, 5);
+        terminal.feed(b"\x1b[?25l");
+
+        assert_eq!(
+            ime_cursor_area_for_snapshot(&terminal.snapshot(), CellMetrics::default(), 0, 0),
+            None
+        );
     }
 
     #[test]

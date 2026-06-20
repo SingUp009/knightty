@@ -149,7 +149,7 @@ fn command_for_shell(shell: String) -> CommandBuilder {
 fn command_for_shell_with_identity(shell: String, identity: &PromptIdentity) -> CommandBuilder {
     let shell_kind = shell_kind(&shell);
     let mut command = CommandBuilder::new(&shell);
-    add_default_shell_args(shell_kind, &mut command);
+    add_default_shell_args(shell_kind, identity, &mut command);
     configure_prompt_header(shell_kind, &[], identity, &mut command);
     command
 }
@@ -165,22 +165,62 @@ fn command_for_configured_shell_with_identity(
     let shell_kind = shell_kind(&shell.program);
     let mut command = CommandBuilder::new(&shell.program);
     command.args(&shell.args);
+    add_configured_shell_args(shell_kind, &shell.args, identity, &mut command);
     configure_prompt_header(shell_kind, &shell.args, identity, &mut command);
     command
 }
 
-fn add_default_shell_args(shell_kind: ShellKind, command: &mut CommandBuilder) {
+fn add_default_shell_args(
+    shell_kind: ShellKind,
+    identity: &PromptIdentity,
+    command: &mut CommandBuilder,
+) {
     #[cfg(windows)]
     {
         if shell_kind == ShellKind::Cmd {
-            command.args(["/Q", "/D", "/K", "cls"]);
+            add_cmd_interactive_args(&[], identity, command);
         }
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (shell_kind, command);
+        let _ = (shell_kind, identity, command);
     }
+}
+
+fn add_configured_shell_args(
+    shell_kind: ShellKind,
+    args: &[String],
+    identity: &PromptIdentity,
+    command: &mut CommandBuilder,
+) {
+    #[cfg(windows)]
+    {
+        if shell_kind == ShellKind::Cmd && !cmd_args_execute_command(args) {
+            add_cmd_interactive_args(args, identity, command);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (shell_kind, args, identity, command);
+    }
+}
+
+#[cfg(windows)]
+fn add_cmd_interactive_args(
+    existing_args: &[String],
+    identity: &PromptIdentity,
+    command: &mut CommandBuilder,
+) {
+    if !cmd_arg_present(existing_args, "q") {
+        command.arg("/Q");
+    }
+    if !cmd_arg_present(existing_args, "d") {
+        command.arg("/D");
+    }
+    command.arg("/K");
+    command.arg(cmd_startup_script(identity));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,9 +276,7 @@ fn configure_prompt_header(
     command: &mut CommandBuilder,
 ) {
     match shell_kind {
-        ShellKind::Cmd => {
-            command.env("PROMPT", cmd_prompt(identity));
-        }
+        ShellKind::Cmd => {}
         ShellKind::PowerShell => {
             if !powershell_args_execute_command(args) {
                 add_powershell_prompt_args(command, args, identity);
@@ -254,16 +292,54 @@ fn configure_prompt_header(
     }
 }
 
-fn cmd_prompt(identity: &PromptIdentity) -> String {
-    format!(
-        "[{}@{} $P]$$$S",
-        cmd_prompt_literal(&identity.username),
-        cmd_prompt_literal(&identity.computer_name)
-    )
+#[cfg(windows)]
+fn cmd_startup_script(identity: &PromptIdentity) -> String {
+    let update_prompt = cmd_update_prompt_command(identity);
+    [
+        "cls".to_owned(),
+        update_prompt.clone(),
+        format!("doskey cd=cd $* ^& {update_prompt}"),
+        format!("doskey cd..=cd .. ^& {update_prompt}"),
+        format!("doskey cd\\=cd \\ ^& {update_prompt}"),
+        format!("doskey chdir=chdir $* ^& {update_prompt}"),
+        format!("doskey pushd=pushd $* ^& {update_prompt}"),
+        format!("doskey popd=popd ^& {update_prompt}"),
+    ]
+    .join(" & ")
 }
 
-fn cmd_prompt_literal(value: &str) -> String {
-    value.replace('$', "$$")
+#[cfg(windows)]
+fn cmd_update_prompt_command(identity: &PromptIdentity) -> String {
+    let prompt_prefix = format!(
+        "[{}@{} ",
+        cmd_prompt_command_literal(&identity.username),
+        cmd_prompt_command_literal(&identity.computer_name)
+    );
+
+    let update = format!(
+        "for %I in (.) do @if /I \"%~fI\"==\"%USERPROFILE%\" (prompt {prompt_prefix}~]$$$S) else if \"%~nxI\"==\"\" (prompt {prompt_prefix}%~fI]$$$S) else (prompt {prompt_prefix}%~nxI]$$$S)"
+    );
+    format!("({update})")
+}
+
+#[cfg(windows)]
+fn cmd_prompt_command_literal(value: &str) -> String {
+    value.chars().fold(String::new(), |mut output, ch| {
+        match ch {
+            '^' => output.push_str("^^"),
+            '&' => output.push_str("^&"),
+            '|' => output.push_str("^|"),
+            '<' => output.push_str("^<"),
+            '>' => output.push_str("^>"),
+            '(' => output.push_str("^("),
+            ')' => output.push_str("^)"),
+            '"' => output.push_str("^\""),
+            '%' => output.push_str("^%"),
+            '$' => output.push_str("$$"),
+            _ => output.push(ch),
+        }
+        output
+    })
 }
 
 fn add_powershell_prompt_args(
@@ -300,6 +376,24 @@ fn powershell_args_execute_command(args: &[String]) -> bool {
             Some("command" | "c" | "file" | "f" | "encodedcommand" | "e")
         )
     })
+}
+
+#[cfg(windows)]
+fn cmd_args_execute_command(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(normalized_cmd_arg(arg).as_deref(), Some("c" | "k")))
+}
+
+#[cfg(windows)]
+fn cmd_arg_present(args: &[String], expected: &str) -> bool {
+    args.iter()
+        .any(|arg| normalized_cmd_arg(arg).as_deref() == Some(expected))
+}
+
+#[cfg(windows)]
+fn normalized_cmd_arg(arg: &str) -> Option<String> {
+    let trimmed = arg.trim_start_matches(['/', '-']);
+    (trimmed.len() != arg.len()).then(|| trimmed.to_ascii_lowercase())
 }
 
 fn powershell_arg_present(args: &[String], expected: &str) -> bool {
@@ -345,11 +439,23 @@ fn zsh_prompt_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::io::{Read, Write};
+    #[cfg(windows)]
+    use std::sync::mpsc;
+    #[cfg(windows)]
+    use std::thread;
+    #[cfg(windows)]
+    use std::time::{Duration, Instant};
+
     use super::{
-        PromptIdentity, ShellCommand, cmd_prompt, command_for_configured_shell_with_identity,
+        PromptIdentity, ShellCommand, command_for_configured_shell_with_identity,
         command_for_shell_with_identity, posix_prompt, powershell_prompt_script, shell_kind,
         zsh_prompt,
     };
+
+    #[cfg(windows)]
+    use super::{cmd_startup_script, cmd_update_prompt_command};
 
     fn test_identity() -> PromptIdentity {
         PromptIdentity {
@@ -370,11 +476,172 @@ mod tests {
         assert_eq!(argv[1], "/Q");
         assert_eq!(argv[2], "/D");
         assert_eq!(argv[3], "/K");
-        assert_eq!(argv[4], "cls");
         assert_eq!(
-            command.get_env("PROMPT").and_then(|value| value.to_str()),
-            Some("[alice@workstation $P]$$$S")
+            argv[4].to_str(),
+            Some(cmd_startup_script(&identity).as_str())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_prompt_update_matches_powershell_directory_policy() {
+        let identity = test_identity();
+        let update = cmd_update_prompt_command(&identity);
+
+        assert!(update.contains(r#""%~fI"=="%USERPROFILE%""#));
+        assert!(update.contains("prompt [alice@workstation ~]$$$S"));
+        assert!(update.contains("prompt [alice@workstation %~nxI]$$$S"));
+        assert!(update.contains("prompt [alice@workstation %~fI]$$$S"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_startup_updates_prompt_after_directory_commands() {
+        let identity = test_identity();
+        let script = cmd_startup_script(&identity);
+
+        assert!(script.contains("doskey cd=cd $* ^& (for %I in (.) do"));
+        assert!(script.contains("doskey cd..=cd .. ^& (for %I in (.) do"));
+        assert!(script.contains("doskey cd\\=cd \\ ^& (for %I in (.) do"));
+        assert!(script.contains("doskey chdir=chdir $* ^& (for %I in (.) do"));
+        assert!(script.contains("doskey pushd=pushd $* ^& (for %I in (.) do"));
+        assert!(script.contains("doskey popd=popd ^& (for %I in (.) do"));
+        assert!(!script.contains("$T"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_directory_macro_does_not_emit_an_intermediate_stale_prompt() {
+        let identity = test_identity();
+        let current_dir = std::env::current_dir().expect("current directory");
+        let parent_dir = current_dir
+            .parent()
+            .expect("current directory has a parent");
+        let initial_prompt = format!(
+            "[alice@workstation {}]$ ",
+            cmd_prompt_directory_label(&current_dir)
+        );
+        let parent_prompt = format!(
+            "[alice@workstation {}]$ ",
+            cmd_prompt_directory_label(parent_dir)
+        );
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
+        let mut command = command_for_shell_with_identity(shell, &identity);
+        command.cwd(&current_dir);
+        let mut session = super::PtySession::spawn_with_command(
+            super::PtySize {
+                rows: 24,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            command,
+        )
+        .expect("spawn cmd PTY");
+        let mut reader = session.take_reader().expect("take PTY reader");
+        let mut writer = session.take_writer().expect("take PTY writer");
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 || sender.send(bytes[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        collect_pty_output_until(&receiver, "\x1b[6n");
+        writer
+            .write_all(b"\x1b[1;1R")
+            .expect("answer cursor position query");
+        writer.flush().expect("flush cursor position response");
+        collect_pty_output_until(&receiver, &initial_prompt);
+        writer.write_all(b"cd ..\r").expect("write cd command");
+        writer.flush().expect("flush cd command");
+        let output = collect_pty_output_until(&receiver, &parent_prompt);
+
+        assert!(
+            !output.contains(&initial_prompt),
+            "directory macro emitted the stale prompt before updating it: {output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn cmd_prompt_directory_label(path: &std::path::Path) -> String {
+        let is_home = std::env::var_os("USERPROFILE").is_some_and(|home| {
+            path.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&home.to_string_lossy())
+        });
+        if is_home {
+            return "~".to_owned();
+        }
+
+        path.file_name()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    #[cfg(windows)]
+    fn collect_pty_output_until(receiver: &mpsc::Receiver<Vec<u8>>, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        while Instant::now() < deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let Ok(bytes) = receiver.recv_timeout(timeout) else {
+                break;
+            };
+            output.push_str(&String::from_utf8_lossy(&bytes));
+            if output.contains(needle) {
+                return output;
+            }
+        }
+
+        panic!("timed out waiting for {needle:?} in PTY output: {output:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_cmd_without_command_installs_prompt_setup() {
+        let identity = test_identity();
+        let command = command_for_configured_shell_with_identity(
+            &ShellCommand {
+                program: "cmd".to_owned(),
+                args: vec!["/Q".to_owned()],
+            },
+            &identity,
+        );
+        let argv = command.get_argv();
+
+        assert_eq!(argv[0], "cmd");
+        assert_eq!(argv[1], "/Q");
+        assert_eq!(argv[2], "/D");
+        assert_eq!(argv[3], "/K");
+        assert_eq!(
+            argv[4].to_str(),
+            Some(cmd_startup_script(&identity).as_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_cmd_command_is_left_intact() {
+        let identity = test_identity();
+        let command = command_for_configured_shell_with_identity(
+            &ShellCommand {
+                program: "cmd".to_owned(),
+                args: vec!["/C".to_owned(), "echo hi".to_owned()],
+            },
+            &identity,
+        );
+        let argv = command.get_argv();
+
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[0], "cmd");
+        assert_eq!(argv[1], "/C");
+        assert_eq!(argv[2], "echo hi");
     }
 
     #[cfg(windows)]
@@ -482,7 +749,10 @@ mod tests {
             computer_name: "work$station%".to_owned(),
         };
 
-        assert_eq!(cmd_prompt(&identity), "[a$$li%ce@work$$station% $P]$$$S");
+        #[cfg(windows)]
+        assert!(
+            cmd_update_prompt_command(&identity).contains("[a$$li^%ce@work$$station^% %~nxI]$$$S")
+        );
         assert_eq!(
             posix_prompt(&identity),
             r#"[a\$li%ce@work\$station% $(if [ "$PWD" = "$HOME" ]; then printf '~'; else dir=${PWD##*/}; if [ -n "$dir" ]; then printf '%s' "$dir"; else printf '%s' "$PWD"; fi; fi)]$ "#

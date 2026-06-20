@@ -12,6 +12,7 @@ export type ConfigOption = {
   description: string;
   examples: string[];
   validValues?: string[];
+  range?: string;
   reload: ReloadBehavior;
   platform: Platform;
   security?: string;

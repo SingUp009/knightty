@@ -207,6 +207,12 @@ function ConfigOptionCard({ option }: { option: ConfigOptionView }) {
             <dd>{option.validValues.join(", ")}</dd>
           </div>
         )}
+        {option.range && (
+          <div>
+            <dt>Range</dt>
+            <dd>{option.range}</dd>
+          </div>
+        )}
         {option.since && (
           <div>
             <dt>Since</dt>

@@ -197,15 +197,12 @@ impl Terminal {
 
 ## Config 追加
 
-`config.json` に以下を追加してください。
+`knightty.config` に以下を追加してください。
 
-```json
-{
-  "terminal": {
-    "scrollback_lines": 10000,
-    "scroll_multiplier": 3
-  }
-}
+```toml
+[terminal]
+scrollback_lines = 10000
+scroll_multiplier = 3
 ```
 
 既存 config がない場合の default:

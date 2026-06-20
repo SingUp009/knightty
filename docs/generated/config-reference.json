@@ -1,0 +1,1204 @@
+[
+  {
+    "key": "background.gradient.colors",
+    "category": "Background",
+    "type": "list<color>",
+    "default": [],
+    "description": "Gradient color stops. At least two #RRGGBB values are required.",
+    "examples": [
+      "[background.gradient]\ncolors = [\"#1e1e2e\", \"#181825\", \"#11111b\"]\n"
+    ],
+    "range": "at least two #RRGGBB colors",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.gradient.orientation",
+    "category": "Background",
+    "type": "enum",
+    "default": "vertical",
+    "description": "Gradient direction.",
+    "examples": [
+      "[background.gradient]\norientation = \"vertical\"\n"
+    ],
+    "validValues": [
+      "vertical",
+      "horizontal"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.image.fit",
+    "category": "Background",
+    "type": "enum",
+    "default": "cover",
+    "description": "Background image fit mode.",
+    "examples": [
+      "[background.image]\nfit = \"cover\"\n"
+    ],
+    "validValues": [
+      "contain",
+      "cover",
+      "stretch",
+      "tile",
+      "center"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.image.opacity",
+    "category": "Background",
+    "type": "float",
+    "default": 0.25,
+    "description": "Background image opacity. Values are clamped to 0.0 through 1.0.",
+    "examples": [
+      "[background.image]\nopacity = 0.25\n"
+    ],
+    "range": "0.0..=1.0",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.image.path",
+    "category": "Background",
+    "type": "path",
+    "default": null,
+    "description": "PNG background image path. Relative paths resolve from the config file directory.",
+    "examples": [
+      "[background.image]\npath = \"wallpapers/knightty.png\"\n"
+    ],
+    "range": "PNG file",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.image.tint",
+    "category": "Background",
+    "type": "color",
+    "default": null,
+    "description": "Optional #RRGGBB readability tint for image backgrounds.",
+    "examples": [
+      "[background.image]\ntint = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.image.tint_opacity",
+    "category": "Background",
+    "type": "float",
+    "default": 0.6,
+    "description": "Tint opacity for image backgrounds. Values are clamped to 0.0 through 1.0.",
+    "examples": [
+      "[background.image]\ntint_opacity = 0.60\n"
+    ],
+    "range": "0.0..=1.0",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "background.kind",
+    "category": "Background",
+    "type": "enum",
+    "default": "solid",
+    "description": "Background mode.",
+    "examples": [
+      "[background]\nkind = \"gradient\"\n"
+    ],
+    "validValues": [
+      "solid",
+      "gradient",
+      "image"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.background",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override the theme default background color.",
+    "examples": [
+      "colors.background = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.black",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nblack = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.blue",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nblue = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.cyan",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\ncyan = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.green",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\ngreen = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.magenta",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nmagenta = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.red",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nred = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.white",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nwhite = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.bright.yellow",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.bright]\nyellow = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.cursor",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override the cursor body color.",
+    "examples": [
+      "colors.cursor = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.cursor_text",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override text color under a block cursor.",
+    "examples": [
+      "colors.cursor_text = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.foreground",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override the theme default foreground color.",
+    "examples": [
+      "colors.foreground = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.black",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nblack = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.blue",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nblue = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.cyan",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\ncyan = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.green",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\ngreen = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.magenta",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nmagenta = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.red",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nred = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.white",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nwhite = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.normal.yellow",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override one ANSI palette color.",
+    "examples": [
+      "[colors.normal]\nyellow = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.selection_background",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override the selection background color.",
+    "examples": [
+      "colors.selection_background = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "colors.selection_foreground",
+    "category": "Colors",
+    "type": "color",
+    "default": null,
+    "description": "Override the selected text foreground color.",
+    "examples": [
+      "colors.selection_foreground = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "cursor.blink",
+    "category": "Cursor",
+    "type": "bool",
+    "default": true,
+    "description": "Whether the cursor should blink.",
+    "examples": [
+      "[cursor]\nblink = true\n"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "cursor.style",
+    "category": "Cursor",
+    "type": "enum",
+    "default": "block",
+    "description": "Cursor shape used when the terminal application has not requested another style.",
+    "examples": [
+      "[cursor]\nstyle = \"bar\"\n"
+    ],
+    "validValues": [
+      "block",
+      "bar",
+      "underline",
+      "hollow_block"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "effects.retro_crt",
+    "category": "Effects",
+    "type": "bool",
+    "default": false,
+    "description": "Reserved retro CRT effect flag. Disabled by default.",
+    "examples": [
+      "[effects]\nretro_crt = false\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "effects.scanlines",
+    "category": "Effects",
+    "type": "bool",
+    "default": false,
+    "description": "Reserved scanline effect flag. Disabled by default.",
+    "examples": [
+      "[effects]\nscanlines = false\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "font.family",
+    "category": "Font",
+    "type": "string",
+    "default": null,
+    "description": "Renderer に渡すフォントファミリー名。未指定時はレンダラーの既定フォントを使います。",
+    "examples": [
+      "[font]\nfamily = \"CaskaydiaCove Nerd Font\"\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "font.line_height",
+    "category": "Font",
+    "type": "float",
+    "default": null,
+    "description": "セルの行高。未指定時はフォントサイズに合わせたレンダラー既定値を使います。",
+    "examples": [
+      "[font]\nline_height = 22.0\n"
+    ],
+    "range": "finite > 0",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "font.size",
+    "category": "Font",
+    "type": "float",
+    "default": 16.0,
+    "description": "セルメトリクスの基準になるフォントサイズ。0 より大きい有限値を指定します。",
+    "examples": [
+      "[font]\nsize = 18.0\n"
+    ],
+    "range": "finite > 0",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.enabled",
+    "category": "Graphics",
+    "type": "bool",
+    "default": true,
+    "description": "iTerm2 OSC 1337 inline PNG image rendering を有効にします。",
+    "examples": [
+      "[graphics]\nenabled = false\n"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "security": "無効にすると OSC 1337 payload はデコードせず安全に破棄されます。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_decoded_bytes",
+    "category": "Graphics",
+    "type": "int",
+    "default": 134217728,
+    "description": "PNG を RGBA8 へ展開した後に許可する最大バイト数。",
+    "examples": [
+      "[graphics]\nmax_decoded_bytes = 134217728\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_encoded_bytes",
+    "category": "Graphics",
+    "type": "int",
+    "default": 16777216,
+    "description": "Base64 文字列と復号後 PNG データに許可する最大バイト数。",
+    "examples": [
+      "[graphics]\nmax_encoded_bytes = 16777216\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_gpu_bytes",
+    "category": "Graphics",
+    "type": "int",
+    "default": 268435456,
+    "description": "inline image texture に許可する推定 GPU バイト数の合計。",
+    "examples": [
+      "[graphics]\nmax_gpu_bytes = 268435456\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_height",
+    "category": "Graphics",
+    "type": "int",
+    "default": 8192,
+    "description": "デコードを許可する PNG の最大高さ。",
+    "examples": [
+      "[graphics]\nmax_height = 8192\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_images",
+    "category": "Graphics",
+    "type": "int",
+    "default": 128,
+    "description": "同時に保持する inline image resource の最大数。",
+    "examples": [
+      "[graphics]\nmax_images = 128\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_pixels",
+    "category": "Graphics",
+    "type": "int",
+    "default": 32000000,
+    "description": "デコードを許可する PNG の最大総ピクセル数。",
+    "examples": [
+      "[graphics]\nmax_pixels = 32000000\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "graphics.max_width",
+    "category": "Graphics",
+    "type": "int",
+    "default": 8192,
+    "description": "デコードを許可する PNG の最大幅。",
+    "examples": [
+      "[graphics]\nmax_width = 8192\n"
+    ],
+    "range": "1..",
+    "reload": "runtime",
+    "platform": "all",
+    "security": "端末アプリケーションから受信する画像データに対するメモリ使用量の上限です。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.allowed_schemes",
+    "category": "Hyperlink",
+    "type": "list<string>",
+    "default": [
+      "https",
+      "http"
+    ],
+    "description": "Ctrl click で開くことを許可する URL scheme。空配列にすると hyperlink open は無効になります。",
+    "examples": [
+      "[hyperlink]\nallowed_schemes = [\"https\"]\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "security": "許可した scheme は外部アプリケーション起動につながるため、必要な scheme のみに絞ってください。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.hover_background",
+    "category": "Hyperlink",
+    "type": "color",
+    "default": null,
+    "description": "Optional #RRGGBB background override for hovered hyperlinks.",
+    "examples": [
+      "[hyperlink]\nhover_background = \"#313244\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.hover_foreground",
+    "category": "Hyperlink",
+    "type": "color",
+    "default": null,
+    "description": "Optional #RRGGBB foreground override for hovered hyperlinks.",
+    "examples": [
+      "[hyperlink]\nhover_foreground = \"#89b4fa\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.hover_underline",
+    "category": "Hyperlink",
+    "type": "bool",
+    "default": true,
+    "description": "Alias for hyperlink.underline_on_hover.",
+    "examples": [
+      "[hyperlink]\nhover_underline = true\n"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.open_on_ctrl_click",
+    "category": "Hyperlink",
+    "type": "bool",
+    "default": true,
+    "description": "Ctrl click で OSC 8 hyperlink を開くかどうか。",
+    "examples": [
+      "[hyperlink]\nopen_on_ctrl_click = false\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "security": "有効にすると許可された scheme の URL を OS の既定ハンドラーで開きます。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "hyperlink.underline_on_hover",
+    "category": "Hyperlink",
+    "type": "bool",
+    "default": true,
+    "description": "hover 中の hyperlink に underline 表示を付けるかどうか。",
+    "examples": [
+      "[hyperlink]\nunderline_on_hover = false\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "panes.inactive_opacity",
+    "category": "Panes",
+    "type": "float",
+    "default": 1.0,
+    "description": "Opacity multiplier reserved for inactive pane dimming.",
+    "examples": [
+      "[panes]\ninactive_opacity = 0.75\n"
+    ],
+    "range": "0.0..=1.0",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "panes.inactive_tint",
+    "category": "Panes",
+    "type": "color",
+    "default": "#181825",
+    "description": "Tint color used by inactive or unfocused dimming overlays.",
+    "examples": [
+      "[panes]\ninactive_tint = \"#181825\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "render.wgpu_backend",
+    "category": "Render",
+    "type": "enum",
+    "default": "auto",
+    "description": "wgpu の描画バックエンド。環境変数 KNIGHTTY_WGPU_BACKEND がある場合はそちらが優先されます。",
+    "examples": [
+      "[render]\nwgpu_backend = \"gl\"\n"
+    ],
+    "validValues": [
+      "auto",
+      "vulkan",
+      "dx12",
+      "gl"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "search.background",
+    "category": "Search",
+    "type": "color",
+    "default": "#f9e2af",
+    "description": "Background for non-current search matches.",
+    "examples": [
+      "search.background = \"#f9e2af\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "search.foreground",
+    "category": "Search",
+    "type": "color",
+    "default": "#1e1e2e",
+    "description": "Foreground for non-current search matches.",
+    "examples": [
+      "search.foreground = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "search.selected_background",
+    "category": "Search",
+    "type": "color",
+    "default": "#fab387",
+    "description": "Background for the current search match.",
+    "examples": [
+      "search.selected_background = \"#fab387\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "search.selected_foreground",
+    "category": "Search",
+    "type": "color",
+    "default": "#1e1e2e",
+    "description": "Foreground for the current search match.",
+    "examples": [
+      "search.selected_foreground = \"#1e1e2e\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "shell.args",
+    "category": "Shell",
+    "type": "list<string>",
+    "default": [],
+    "description": "shell program に渡す引数の配列。",
+    "examples": [
+      "[shell]\nprogram = \"pwsh\"\nargs = [\"-NoLogo\"]\n"
+    ],
+    "reload": "new-terminal",
+    "platform": "all",
+    "security": "shell program に渡されるため、引数には信頼できる値だけを指定してください。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "shell.program",
+    "category": "Shell",
+    "type": "string",
+    "default": null,
+    "description": "起動する shell program。未指定時は platform の既定 shell を使います。",
+    "examples": [
+      "[shell]\nprogram = \"pwsh\"\n"
+    ],
+    "range": "non-empty when set",
+    "reload": "new-terminal",
+    "platform": "all",
+    "security": "外部コマンド起動につながるため、信頼できる shell program だけを指定してください。",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.active_background",
+    "category": "Tabs",
+    "type": "color",
+    "default": "#313244",
+    "description": "Active tab background color.",
+    "examples": [
+      "tabs.active_background = \"#313244\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.active_foreground",
+    "category": "Tabs",
+    "type": "color",
+    "default": "#cdd6f4",
+    "description": "Active tab foreground color.",
+    "examples": [
+      "tabs.active_foreground = \"#cdd6f4\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.enabled",
+    "category": "Tabs",
+    "type": "bool",
+    "default": false,
+    "description": "Enable tab bar rendering when tab support is present.",
+    "examples": [
+      "[tabs]\nenabled = true\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.inactive_background",
+    "category": "Tabs",
+    "type": "color",
+    "default": "#181825",
+    "description": "Inactive tab background color.",
+    "examples": [
+      "tabs.inactive_background = \"#181825\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.inactive_foreground",
+    "category": "Tabs",
+    "type": "color",
+    "default": "#7f849c",
+    "description": "Inactive tab foreground color.",
+    "examples": [
+      "tabs.inactive_foreground = \"#7f849c\"\n"
+    ],
+    "range": "#RRGGBB",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.show_when_single",
+    "category": "Tabs",
+    "type": "bool",
+    "default": false,
+    "description": "Show the tab bar even when only one tab exists.",
+    "examples": [
+      "[tabs]\nshow_when_single = false\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "tabs.style",
+    "category": "Tabs",
+    "type": "enum",
+    "default": "minimal",
+    "description": "Tab bar visual style. Only minimal is currently rendered.",
+    "examples": [
+      "[tabs]\nstyle = \"minimal\"\n"
+    ],
+    "validValues": [
+      "minimal",
+      "separator",
+      "powerline",
+      "slant"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "terminal.scroll_multiplier",
+    "category": "Terminal",
+    "type": "int",
+    "default": 3,
+    "description": "通常スクロール時に 1 wheel step あたり移動する行数。1 から 100 までの値を指定できます。",
+    "examples": [
+      "[terminal]\nscroll_multiplier = 5\n"
+    ],
+    "range": "1..=100",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "terminal.scrollback_lines",
+    "category": "Terminal",
+    "type": "int",
+    "default": 10000,
+    "description": "保持するスクロールバック行数。0 から 100000 までの値を指定できます。",
+    "examples": [
+      "[terminal]\nscrollback_lines = 20000\n"
+    ],
+    "range": "0..=100000",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "theme",
+    "category": "Appearance",
+    "type": "string",
+    "default": "Catppuccin Mocha",
+    "description": "Built-in theme name. Unknown names fall back to the default theme with a warning.",
+    "examples": [
+      "theme = \"Catppuccin Mocha\"\n"
+    ],
+    "validValues": [
+      "Catppuccin Latte",
+      "Catppuccin Frappe",
+      "Catppuccin Macchiato",
+      "Catppuccin Mocha"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "theme.dark",
+    "category": "Appearance",
+    "type": "string",
+    "default": "Catppuccin Mocha",
+    "description": "Dark theme name used by the theme pair config.",
+    "examples": [
+      "[theme]\ndark = \"Catppuccin Mocha\"\n"
+    ],
+    "validValues": [
+      "Catppuccin Latte",
+      "Catppuccin Frappe",
+      "Catppuccin Macchiato",
+      "Catppuccin Mocha"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "theme.light",
+    "category": "Appearance",
+    "type": "string",
+    "default": "Catppuccin Latte",
+    "description": "Light theme name used by the theme pair config.",
+    "examples": [
+      "[theme]\nlight = \"Catppuccin Latte\"\n"
+    ],
+    "validValues": [
+      "Catppuccin Latte",
+      "Catppuccin Frappe",
+      "Catppuccin Macchiato",
+      "Catppuccin Mocha"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "theme.mode",
+    "category": "Appearance",
+    "type": "enum",
+    "default": "system",
+    "description": "Theme pair selection mode. System mode currently falls back to the dark theme.",
+    "examples": [
+      "[theme]\nmode = \"system\"\n"
+    ],
+    "validValues": [
+      "system",
+      "light",
+      "dark"
+    ],
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.blur",
+    "category": "Window",
+    "type": "bool",
+    "default": false,
+    "description": "Requests platform blur when opacity is below 1.0. Unsupported platforms continue without blur.",
+    "examples": [
+      "[window]\nblur = true\n"
+    ],
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.blur_radius",
+    "category": "Window",
+    "type": "int",
+    "default": 20,
+    "description": "Requested blur radius, clamped by the renderer appearance layer.",
+    "examples": [
+      "[window]\nblur_radius = 20\n"
+    ],
+    "range": "0..=100",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.initial_cols",
+    "category": "Window",
+    "type": "int",
+    "default": 80,
+    "description": "起動時に作成する端末グリッドの列数。0 より大きい値を指定します。",
+    "examples": [
+      "[window]\ninitial_cols = 120\n"
+    ],
+    "range": "1..",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.initial_rows",
+    "category": "Window",
+    "type": "int",
+    "default": 24,
+    "description": "起動時に作成する端末グリッドの行数。0 より大きい値を指定します。",
+    "examples": [
+      "[window]\ninitial_rows = 36\n"
+    ],
+    "range": "1..",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.opacity",
+    "category": "Window",
+    "type": "float",
+    "default": 1.0,
+    "description": "Window background opacity. Values are clamped to 0.0 through 1.0.",
+    "examples": [
+      "[window]\nopacity = 0.90\n"
+    ],
+    "range": "0.0..=1.0",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.padding_x",
+    "category": "Window",
+    "type": "int",
+    "default": 0,
+    "description": "Horizontal padding in physical pixels.",
+    "examples": [
+      "[window]\npadding_x = 12\n"
+    ],
+    "range": "0..",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.padding_y",
+    "category": "Window",
+    "type": "int",
+    "default": 0,
+    "description": "Vertical padding in physical pixels.",
+    "examples": [
+      "[window]\npadding_y = 10\n"
+    ],
+    "range": "0..",
+    "reload": "restart",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.unfocused_opacity",
+    "category": "Window",
+    "type": "float",
+    "default": 1.0,
+    "description": "Optional opacity multiplier used for unfocused window dimming.",
+    "examples": [
+      "[window]\nunfocused_opacity = 0.92\n"
+    ],
+    "range": "0.0..=1.0",
+    "reload": "runtime",
+    "platform": "all",
+    "since": "0.1.0"
+  },
+  {
+    "key": "window.windows.backdrop",
+    "category": "Window",
+    "type": "enum",
+    "default": "none",
+    "description": "Windows backdrop request. Unsupported environments warn and continue without the effect.",
+    "examples": [
+      "[window.windows]\nbackdrop = \"mica\"\n"
+    ],
+    "validValues": [
+      "none",
+      "acrylic",
+      "mica",
+      "tabbed"
+    ],
+    "reload": "restart",
+    "platform": "windows",
+    "since": "0.1.0"
+  }
+]

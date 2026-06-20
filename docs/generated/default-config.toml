@@ -1,0 +1,97 @@
+# Knightty configuration.
+# This file is generated from Rust defaults. Optional unset values are left as comments.
+
+theme = "Catppuccin Mocha"
+
+[font]
+# family = "CaskaydiaCove Nerd Font"
+size = 16.0
+# line_height = 18.0
+
+[window]
+initial_cols = 80
+initial_rows = 24
+opacity = 1.0
+padding_x = 0
+padding_y = 0
+unfocused_opacity = 1.0
+blur = false
+blur_radius = 20
+
+[window.windows]
+backdrop = "none"
+
+[cursor]
+style = "block"
+blink = true
+
+[colors]
+# background = "#1e1e2e"
+# foreground = "#cdd6f4"
+# selection_background = "#45475a"
+# selection_foreground = "#cdd6f4"
+# cursor = "#f5e0dc"
+# cursor_text = "#1e1e2e"
+
+[background]
+kind = "solid"
+
+[background.gradient]
+orientation = "vertical"
+colors = []
+
+[background.image]
+# path = "wallpapers/knightty.png"
+opacity = 0.25
+fit = "cover"
+# tint = "#1e1e2e"
+tint_opacity = 0.60
+
+[search]
+foreground = "#1e1e2e"
+background = "#f9e2af"
+selected_foreground = "#1e1e2e"
+selected_background = "#fab387"
+
+[panes]
+inactive_opacity = 1.0
+inactive_tint = "#181825"
+
+[tabs]
+enabled = false
+show_when_single = false
+style = "minimal"
+active_background = "#313244"
+active_foreground = "#cdd6f4"
+inactive_background = "#181825"
+inactive_foreground = "#7f849c"
+
+[effects]
+retro_crt = false
+scanlines = false
+
+[render]
+wgpu_backend = "auto"
+
+[terminal]
+scrollback_lines = 10000
+scroll_multiplier = 3
+
+[graphics]
+enabled = true
+max_encoded_bytes = 16777216
+max_decoded_bytes = 134217728
+max_width = 8192
+max_height = 8192
+max_pixels = 32000000
+max_images = 128
+max_gpu_bytes = 268435456
+
+[shell]
+# program = "pwsh"
+args = []
+
+[hyperlink]
+open_on_ctrl_click = true
+allowed_schemes = ["https", "http"]
+underline_on_hover = true

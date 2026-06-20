@@ -29,7 +29,7 @@
 - 背景・下線・カーソルは wgpu の矩形描画で出る
 - 文字は glyphon の glyph cache / atlas / text renderer を使って描画される
 - `app` の terminal / PTY resize は renderer の cell metrics を基準にする
-- `config.json` からフォント family / size / line height / 初期セル数 / wgpu backend を読める
+- `knightty.config` からフォント family / size / line height / 初期セル数 / wgpu backend を読める
 - `cargo run -p app` で実ウィンドウが開き、入力・色・スタイル・リサイズが確認できる
 
 ---
@@ -76,9 +76,9 @@
 
 ---
 
-## 5. config.json
+## 5. knightty.config
 
-`config.json` は初回起動時に自動生成しない。存在しない場合は既存のデフォルト設定で起動する。
+`knightty.config` は初回起動時に自動生成しない。存在しない場合は既存のデフォルト設定で起動する。
 
 探索順は以下の通り。
 
@@ -88,33 +88,30 @@
 Windows:
 
 ```text
-%APPDATA%\knightty\config.json
+%APPDATA%\knightty\knightty.config
 ```
 
 Linux:
 
 ```text
-$XDG_CONFIG_HOME/knightty/config.json
-~/.config/knightty/config.json
+$XDG_CONFIG_HOME/knightty/knightty.config
+~/.config/knightty/knightty.config
 ```
 
 最小例:
 
-```json
-{
-  "font": {
-    "family": "CaskaydiaCove Nerd Font",
-    "size": 16,
-    "line_height": 18
-  },
-  "window": {
-    "initial_cols": 100,
-    "initial_rows": 30
-  },
-  "render": {
-    "wgpu_backend": "auto"
-  }
-}
+```toml
+[font]
+family = "CaskaydiaCove Nerd Font"
+size = 16.0
+line_height = 18.0
+
+[window]
+initial_cols = 100
+initial_rows = 30
+
+[render]
+wgpu_backend = "auto"
 ```
 
 `KNIGHTTY_WGPU_BACKEND` は一時的なデバッグ用 override として残し、`render.wgpu_backend` より優先する。
@@ -146,7 +143,7 @@ echo [31mred[0m [48;2;1;2;3mbackground[0m [1;3;4mbold italic underline[0m
 - bold / italic / underline が反映される
 - カーソルが表示される
 - ウィンドウリサイズで列数・行数が更新され、PTY 側にも反映される
-- Nerd Font 系 family を `config.json` に指定すると LazyVim などの private-use glyph の欠けが改善する
+- Nerd Font 系 family を `knightty.config` に指定すると LazyVim などの private-use glyph の欠けが改善する
 
 ---
 

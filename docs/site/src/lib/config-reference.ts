@@ -90,6 +90,7 @@ function buildSearchText(option: ConfigOption): string {
     option.description,
     option.examples.join(" "),
     option.validValues?.join(" ") ?? "",
+    option.range ?? "",
     option.reload,
     option.platform,
     option.security ?? "",

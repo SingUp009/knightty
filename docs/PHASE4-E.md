@@ -109,16 +109,13 @@ ftp
 
 ## Config 追加
 
-`config.json` に以下を追加してください。
+`knightty.config` に以下を追加してください。
 
-```json
-{
-  "hyperlink": {
-    "open_on_ctrl_click": true,
-    "allowed_schemes": ["https", "http"],
-    "underline_on_hover": true
-  }
-}
+```toml
+[hyperlink]
+open_on_ctrl_click = true
+allowed_schemes = ["https", "http"]
+underline_on_hover = true
 ```
 
 default:

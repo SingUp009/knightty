@@ -22,7 +22,7 @@ Phase 2 の描画基盤も完了済みです。
 - wide spacer は文字として描画しない
 - Shaping::Advanced に切り替え済み
 - liga / clig / dlig / calt は無効化済み
-- config.json 基盤あり
+- knightty.config 基盤あり
 - Windows 起動時の cmd.exe バナー抑制済み
 
 ## 今回の目的

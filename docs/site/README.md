@@ -18,3 +18,17 @@ Run commands from `docs/site`.
 
 `src/lib/config-reference.ts` reads `../generated/config-reference.json` first and falls back to
 `src/data/config-reference.fixture.json` while generated data does not exist.
+
+Generate the Rust-backed reference artifacts from the workspace root:
+
+```bash
+cargo run -p xtask -- generate-config-docs
+```
+
+The same Rust source can print the default TOML user config:
+
+```bash
+cargo run -p app -- +print-default-config
+```
+
+Knightty reads TOML from `knightty.config`; the old `config.json` path is not used.

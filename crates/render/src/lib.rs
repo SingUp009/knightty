@@ -146,14 +146,51 @@ pub struct InlineImageData {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImageQuadPlan {
     pub image_id: ImageId,
+    pub destination: PixelRect,
+    pub uv: UvRect,
+    pub z_index: i32,
+    pub client_image_id: u32,
+    pub insertion_order: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelRect {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UvRect {
     pub u0: f32,
     pub v0: f32,
     pub u1: f32,
     pub v1: f32,
+}
+
+const BELOW_CELL_BACKGROUND: i32 = i32::MIN / 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineImageLayer {
+    BelowCellBackground,
+    BelowText,
+    Zero,
+    AboveText,
+}
+
+impl InlineImageLayer {
+    const fn for_z_index(z_index: i32) -> Self {
+        if z_index < BELOW_CELL_BACKGROUND {
+            Self::BelowCellBackground
+        } else if z_index < 0 {
+            Self::BelowText
+        } else if z_index == 0 {
+            Self::Zero
+        } else {
+            Self::AboveText
+        }
+    }
 }
 
 /// Contiguous visible cells associated with one hyperlink.
@@ -1162,14 +1199,29 @@ impl Renderer {
                 &mut pass,
                 active_background_image.map(|(_, texture)| texture),
             );
+            self.image_pipeline.draw_inline(
+                &mut pass,
+                &self.inline_images,
+                InlineImageLayer::BelowCellBackground,
+            );
             self.rect_pipeline
                 .draw(&mut pass, PreparedRectLayer::Background);
+            self.image_pipeline.draw_inline(
+                &mut pass,
+                &self.inline_images,
+                InlineImageLayer::BelowText,
+            );
             self.image_pipeline
-                .draw_inline(&mut pass, &self.inline_images);
+                .draw_inline(&mut pass, &self.inline_images, InlineImageLayer::Zero);
             self.rect_pipeline
                 .draw(&mut pass, PreparedRectLayer::Selection);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
+            self.image_pipeline.draw_inline(
+                &mut pass,
+                &self.inline_images,
+                InlineImageLayer::AboveText,
+            );
             self.rect_pipeline
                 .draw(&mut pass, PreparedRectLayer::Overlay);
         }
@@ -1438,30 +1490,36 @@ fn push_inline_image_quads(
     layout: RenderLayout,
     images: &mut Vec<ImageQuadPlan>,
 ) {
-    for placement in &snapshot.image_placements {
-        if let Some(quad) = inline_image_quad(placement, snapshot, layout) {
+    for (insertion_order, placement) in snapshot.image_placements.iter().enumerate() {
+        if let Some(quad) = inline_image_quad(placement, snapshot, layout, insertion_order as u64) {
             images.push(quad);
         }
     }
+    images.sort_by_key(|image| (image.z_index, image.client_image_id, image.insertion_order));
 }
 
 fn inline_image_quad(
     placement: &ImagePlacement,
     snapshot: &GridSnapshot,
     layout: RenderLayout,
+    insertion_order: u64,
 ) -> Option<ImageQuadPlan> {
-    let left = layout.origin_x as f32 + placement.anchor.col as f32 * layout.metrics.width as f32;
-    let top = layout.origin_y as f32 + placement.anchor.row as f32 * layout.metrics.height as f32;
-    let width = f32::from(placement.columns) * layout.metrics.width as f32;
-    let height = f32::from(placement.rows) * layout.metrics.height as f32;
+    let left = f64::from(layout.origin_x)
+        + placement.anchor.col as f64 * f64::from(layout.metrics.width)
+        + f64::from(placement.pixel_offset.x);
+    let top = f64::from(layout.origin_y)
+        + placement.anchor.row as f64 * f64::from(layout.metrics.height)
+        + f64::from(placement.pixel_offset.y);
+    let width = f64::from(placement.columns) * f64::from(layout.metrics.width);
+    let height = f64::from(placement.rows) * f64::from(layout.metrics.height);
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
 
-    let grid_left = layout.origin_x as f32;
-    let grid_top = layout.origin_y as f32;
-    let grid_right = grid_left + snapshot.cols as f32 * layout.metrics.width as f32;
-    let grid_bottom = grid_top + snapshot.rows as f32 * layout.metrics.height as f32;
+    let grid_left = f64::from(layout.origin_x);
+    let grid_top = f64::from(layout.origin_y);
+    let grid_right = grid_left + snapshot.cols as f64 * f64::from(layout.metrics.width);
+    let grid_bottom = grid_top + snapshot.rows as f64 * f64::from(layout.metrics.height);
     let clipped_left = left.max(grid_left);
     let clipped_top = top.max(grid_top);
     let clipped_right = (left + width).min(grid_right);
@@ -1470,16 +1528,45 @@ fn inline_image_quad(
         return None;
     }
 
+    let source_right = placement
+        .source_rect
+        .x
+        .checked_add(placement.source_rect.width)?;
+    let source_bottom = placement
+        .source_rect
+        .y
+        .checked_add(placement.source_rect.height)?;
+    let source_width = f64::from(placement.source_width);
+    let source_height = f64::from(placement.source_height);
+    if source_width <= 0.0 || source_height <= 0.0 {
+        return None;
+    }
+    let base_u0 = f64::from(placement.source_rect.x) / source_width;
+    let base_v0 = f64::from(placement.source_rect.y) / source_height;
+    let base_u1 = f64::from(source_right) / source_width;
+    let base_v1 = f64::from(source_bottom) / source_height;
+    let left_clip = (clipped_left - left) / width;
+    let top_clip = (clipped_top - top) / height;
+    let right_clip = (clipped_right - left) / width;
+    let bottom_clip = (clipped_bottom - top) / height;
+
     Some(ImageQuadPlan {
         image_id: placement.image_id,
-        x: clipped_left,
-        y: clipped_top,
-        width: clipped_right - clipped_left,
-        height: clipped_bottom - clipped_top,
-        u0: (clipped_left - left) / width,
-        v0: (clipped_top - top) / height,
-        u1: (clipped_right - left) / width,
-        v1: (clipped_bottom - top) / height,
+        destination: PixelRect {
+            x: clipped_left as f32,
+            y: clipped_top as f32,
+            width: (clipped_right - clipped_left) as f32,
+            height: (clipped_bottom - clipped_top) as f32,
+        },
+        uv: UvRect {
+            u0: (base_u0 + (base_u1 - base_u0) * left_clip) as f32,
+            v0: (base_v0 + (base_v1 - base_v0) * top_clip) as f32,
+            u1: (base_u0 + (base_u1 - base_u0) * right_clip) as f32,
+            v1: (base_v0 + (base_v1 - base_v0) * bottom_clip) as f32,
+        },
+        z_index: placement.z_index.0,
+        client_image_id: placement.kitty_image_id.unwrap_or(0),
+        insertion_order,
     })
 }
 
@@ -2715,7 +2802,7 @@ impl BackgroundImageTexture {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                    resource: wgpu::BindingResource::Sampler(&pipeline.background_sampler),
                 },
             ],
         });
@@ -2791,7 +2878,7 @@ impl InlineImageTexture {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                    resource: wgpu::BindingResource::Sampler(&pipeline.inline_sampler),
                 },
             ],
         });
@@ -2817,7 +2904,8 @@ enum InlineImageUploadError {
 struct ImagePipeline {
     pipeline: RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    background_sampler: wgpu::Sampler,
+    inline_sampler: wgpu::Sampler,
     background_vertices: ImageVertexBuffer,
     inline_vertices: ImageVertexBuffer,
     inline_draws: Vec<PreparedInlineImageDraw>,
@@ -2826,6 +2914,7 @@ struct ImagePipeline {
 struct PreparedInlineImageDraw {
     image_id: ImageId,
     vertices: Range<u32>,
+    layer: InlineImageLayer,
 }
 
 impl ImagePipeline {
@@ -2855,10 +2944,18 @@ impl ImagePipeline {
                 },
             ],
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("knightty background image sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let inline_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("knightty inline image sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -2920,7 +3017,8 @@ impl ImagePipeline {
         Self {
             pipeline,
             bind_group_layout,
-            sampler,
+            background_sampler,
+            inline_sampler,
             background_vertices: ImageVertexBuffer::new(device),
             inline_vertices: ImageVertexBuffer::new(device),
             inline_draws: Vec::new(),
@@ -2983,6 +3081,7 @@ impl ImagePipeline {
             self.inline_draws.push(PreparedInlineImageDraw {
                 image_id: plan.image_id,
                 vertices: start..end,
+                layer: InlineImageLayer::for_z_index(plan.z_index),
             });
         }
         self.inline_vertices
@@ -2993,13 +3092,14 @@ impl ImagePipeline {
         &'a self,
         pass: &mut RenderPass<'a>,
         textures: &'a BTreeMap<ImageId, InlineImageTexture>,
+        layer: InlineImageLayer,
     ) {
         if self.inline_vertices.vertex_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.inline_vertices.buffer.slice(..));
-        for draw in &self.inline_draws {
+        for draw in self.inline_draws.iter().filter(|draw| draw.layer == layer) {
             let Some(texture) = textures.get(&draw.image_id) else {
                 continue;
             };
@@ -3085,18 +3185,18 @@ fn inline_image_vertices(
     surface_width: u32,
     surface_height: u32,
 ) -> [ImageVertex; 6] {
-    let left = to_ndc_x_f32(quad.x, surface_width);
-    let right = to_ndc_x_f32(quad.x + quad.width, surface_width);
-    let top = to_ndc_y_f32(quad.y, surface_height);
-    let bottom = to_ndc_y_f32(quad.y + quad.height, surface_height);
+    let left = to_ndc_x_f32(quad.destination.x, surface_width);
+    let right = to_ndc_x_f32(quad.destination.x + quad.destination.width, surface_width);
+    let top = to_ndc_y_f32(quad.destination.y, surface_height);
+    let bottom = to_ndc_y_f32(quad.destination.y + quad.destination.height, surface_height);
 
     [
-        ImageVertex::new(left, top, quad.u0, quad.v0, 1.0),
-        ImageVertex::new(right, top, quad.u1, quad.v0, 1.0),
-        ImageVertex::new(right, bottom, quad.u1, quad.v1, 1.0),
-        ImageVertex::new(left, top, quad.u0, quad.v0, 1.0),
-        ImageVertex::new(right, bottom, quad.u1, quad.v1, 1.0),
-        ImageVertex::new(left, bottom, quad.u0, quad.v1, 1.0),
+        ImageVertex::new(left, top, quad.uv.u0, quad.uv.v0, 1.0),
+        ImageVertex::new(right, top, quad.uv.u1, quad.uv.v0, 1.0),
+        ImageVertex::new(right, bottom, quad.uv.u1, quad.uv.v1, 1.0),
+        ImageVertex::new(left, top, quad.uv.u0, quad.uv.v0, 1.0),
+        ImageVertex::new(right, bottom, quad.uv.u1, quad.uv.v1, 1.0),
+        ImageVertex::new(left, bottom, quad.uv.u0, quad.uv.v1, 1.0),
     ]
 }
 
@@ -3614,20 +3714,20 @@ pub enum RenderError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundAppearance, BackgroundKind, CellMetrics, CursorStyle, DEFAULT_FG,
-        GradientBackground, GradientOrientation, ImageBackground, ImageFit, ImageLoadState,
-        ImageQuadPlan, ImePreedit, InlineImageData, RectLayer, RectPlan, RenderOptions,
-        RendererAppearance, Rgba, SearchMatch, TextStyle, attrs_for_style, background_pass_rects,
-        build_render_plan, build_render_plan_with_appearance, build_render_plan_with_options,
-        builtin_theme, builtin_theme_names, clamp_blur_radius, clamp_opacity, effect_overlay_rects,
-        image_quad, image_vertices, inline_image_cache_changes, resolve_theme_name,
-        unique_font_family_infos,
+        BELOW_CELL_BACKGROUND, BackgroundAppearance, BackgroundKind, CellMetrics, CursorStyle,
+        DEFAULT_FG, GradientBackground, GradientOrientation, ImageBackground, ImageFit,
+        ImageLoadState, ImageQuadPlan, ImePreedit, InlineImageData, InlineImageLayer, PixelRect,
+        RectLayer, RectPlan, RenderOptions, RendererAppearance, Rgba, SearchMatch, TextStyle,
+        UvRect, attrs_for_style, background_pass_rects, build_render_plan,
+        build_render_plan_with_appearance, build_render_plan_with_options, builtin_theme,
+        builtin_theme_names, clamp_blur_radius, clamp_opacity, effect_overlay_rects, image_quad,
+        image_vertices, inline_image_cache_changes, resolve_theme_name, unique_font_family_infos,
     };
     use glyphon::Family;
     use glyphon::cosmic_text::FeatureTag;
     use knightty_core::{
-        Damage, GridPoint, ImageId, ImagePlacement, ImagePlacementId, SelectionMode,
-        SelectionPoint, Terminal,
+        Damage, GridPoint, ImageId, ImagePixelOffset, ImagePlacement, ImagePlacementId,
+        ImageSourceRect, ImageZIndex, SelectionMode, SelectionPoint, Terminal,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -4128,11 +4228,20 @@ mod tests {
         terminal.add_image_placement(ImagePlacement {
             placement_id: ImagePlacementId::new(7),
             image_id: ImageId::new(7),
+            kitty_image_id: None,
             anchor: GridPoint { col: 2, row: 1 },
             columns: 3,
             rows: 2,
             source_width: 30,
             source_height: 40,
+            source_rect: ImageSourceRect {
+                x: 0,
+                y: 0,
+                width: 30,
+                height: 40,
+            },
+            pixel_offset: ImagePixelOffset::default(),
+            z_index: ImageZIndex::default(),
         });
         terminal.feed(b"X");
         let metrics = CellMetrics {
@@ -4148,14 +4257,21 @@ mod tests {
             plan.images,
             vec![ImageQuadPlan {
                 image_id: ImageId::new(7),
-                x: 20.0,
-                y: 20.0,
-                width: 30.0,
-                height: 40.0,
-                u0: 0.0,
-                v0: 0.0,
-                u1: 1.0,
-                v1: 1.0,
+                destination: PixelRect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 30.0,
+                    height: 40.0,
+                },
+                uv: UvRect {
+                    u0: 0.0,
+                    v0: 0.0,
+                    u1: 1.0,
+                    v1: 1.0,
+                },
+                z_index: 0,
+                client_image_id: 0,
+                insertion_order: 0,
             }]
         );
         assert_eq!(plan.text.len(), 1);
@@ -4167,11 +4283,20 @@ mod tests {
         terminal.add_image_placement(ImagePlacement {
             placement_id: ImagePlacementId::new(8),
             image_id: ImageId::new(8),
+            kitty_image_id: None,
             anchor: GridPoint { col: 0, row: -1 },
             columns: 2,
             rows: 2,
             source_width: 20,
             source_height: 40,
+            source_rect: ImageSourceRect {
+                x: 0,
+                y: 10,
+                width: 20,
+                height: 20,
+            },
+            pixel_offset: ImagePixelOffset::default(),
+            z_index: ImageZIndex::default(),
         });
         let metrics = CellMetrics {
             width: 10,
@@ -4182,10 +4307,161 @@ mod tests {
 
         let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
 
-        assert_eq!(plan.images[0].y, 0.0);
-        assert_eq!(plan.images[0].height, 20.0);
-        assert_eq!(plan.images[0].v0, 0.5);
-        assert_eq!(plan.images[0].v1, 1.0);
+        assert_eq!(plan.images[0].destination.y, 0.0);
+        assert_eq!(plan.images[0].destination.height, 20.0);
+        assert_eq!(plan.images[0].uv.v0, 0.5);
+        assert_eq!(plan.images[0].uv.v1, 0.75);
+    }
+
+    #[test]
+    fn inline_image_crop_offset_and_resize_recalculate_destination_and_uvs() {
+        let mut terminal = Terminal::new(10, 4);
+        terminal.add_image_placement(ImagePlacement {
+            placement_id: ImagePlacementId::new(9),
+            image_id: ImageId::new(9),
+            kitty_image_id: Some(42),
+            anchor: GridPoint { col: 0, row: 0 },
+            columns: 2,
+            rows: 2,
+            source_width: 100,
+            source_height: 80,
+            source_rect: ImageSourceRect {
+                x: 20,
+                y: 10,
+                width: 40,
+                height: 20,
+            },
+            pixel_offset: ImagePixelOffset { x: 5, y: 10 },
+            z_index: ImageZIndex(-1),
+        });
+        let snapshot = terminal.snapshot();
+
+        let original = build_render_plan(
+            &snapshot,
+            &Damage::Full,
+            CellMetrics {
+                width: 10,
+                height: 20,
+                font_size: 16.0,
+                line_height: 20.0,
+            },
+        );
+        assert_eq!(
+            original.images[0].destination,
+            PixelRect {
+                x: 5.0,
+                y: 10.0,
+                width: 20.0,
+                height: 40.0,
+            }
+        );
+        assert_eq!(
+            original.images[0].uv,
+            UvRect {
+                u0: 0.2,
+                v0: 0.125,
+                u1: 0.6,
+                v1: 0.375,
+            }
+        );
+
+        let resized = build_render_plan(
+            &snapshot,
+            &Damage::Full,
+            CellMetrics {
+                width: 4,
+                height: 8,
+                font_size: 8.0,
+                line_height: 8.0,
+            },
+        );
+        assert_eq!(resized.images[0].destination.x, 5.0);
+        assert_eq!(resized.images[0].destination.y, 10.0);
+        assert_eq!(resized.images[0].destination.width, 8.0);
+        assert_eq!(resized.images[0].destination.height, 16.0);
+    }
+
+    #[test]
+    fn kitty_images_sort_by_z_client_id_and_stable_insertion_order() {
+        let mut terminal = Terminal::new(4, 2);
+        let placements = [
+            (1, 42, 0),
+            (2, 7, 0),
+            (3, 1, BELOW_CELL_BACKGROUND - 1),
+            (4, 1, BELOW_CELL_BACKGROUND),
+            (5, 1, -1),
+            (6, 1, 1),
+            (7, 7, 0),
+        ];
+        for (id, client_image_id, z_index) in placements {
+            terminal.add_image_placement(ImagePlacement {
+                placement_id: ImagePlacementId::new(id),
+                image_id: ImageId::new(id),
+                kitty_image_id: Some(client_image_id),
+                anchor: GridPoint { col: 0, row: 0 },
+                columns: 1,
+                rows: 1,
+                source_width: 1,
+                source_height: 1,
+                source_rect: ImageSourceRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                pixel_offset: ImagePixelOffset::default(),
+                z_index: ImageZIndex(z_index),
+            });
+        }
+
+        let plan = build_render_plan(
+            &terminal.snapshot(),
+            &Damage::Full,
+            CellMetrics {
+                width: 10,
+                height: 20,
+                font_size: 16.0,
+                line_height: 20.0,
+            },
+        );
+        assert_eq!(
+            plan.images
+                .iter()
+                .map(|image| image.image_id)
+                .collect::<Vec<_>>(),
+            vec![
+                ImageId::new(3),
+                ImageId::new(4),
+                ImageId::new(5),
+                ImageId::new(2),
+                ImageId::new(7),
+                ImageId::new(1),
+                ImageId::new(6),
+            ]
+        );
+        assert_eq!(plan.images[3].insertion_order, 1);
+        assert_eq!(plan.images[4].insertion_order, 6);
+    }
+
+    #[test]
+    fn kitty_z_threshold_maps_to_four_render_layers() {
+        assert_eq!(
+            InlineImageLayer::for_z_index(BELOW_CELL_BACKGROUND - 1),
+            InlineImageLayer::BelowCellBackground
+        );
+        assert_eq!(
+            InlineImageLayer::for_z_index(BELOW_CELL_BACKGROUND),
+            InlineImageLayer::BelowText
+        );
+        assert_eq!(
+            InlineImageLayer::for_z_index(-1),
+            InlineImageLayer::BelowText
+        );
+        assert_eq!(InlineImageLayer::for_z_index(0), InlineImageLayer::Zero);
+        assert_eq!(
+            InlineImageLayer::for_z_index(1),
+            InlineImageLayer::AboveText
+        );
     }
 
     #[test]
@@ -4212,6 +4488,17 @@ mod tests {
         assert_eq!(
             upload.into_iter().collect::<Vec<_>>(),
             vec![ImageId::new(3)]
+        );
+
+        let (remove, upload) = inline_image_cache_changes([ImageId::new(2)], &[]);
+        assert_eq!(remove, vec![ImageId::new(2)]);
+        assert!(upload.is_empty());
+
+        let (remove, upload) = inline_image_cache_changes([], &requested[..1]);
+        assert!(remove.is_empty());
+        assert_eq!(
+            upload.into_iter().collect::<Vec<_>>(),
+            vec![ImageId::new(2)]
         );
     }
 

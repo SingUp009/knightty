@@ -3,8 +3,12 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::ImageFormat;
-use knightty_core::{GridPoint, ImageId, ImagePlacement, ImagePlacementId};
+use knightty_core::{
+    GridPoint, ImageId, ImagePixelOffset, ImagePlacement, ImagePlacementId, ImageSourceRect,
+    ImageZIndex,
+};
 use knightty_proto::iterm2::{ImageDimension, InlineImageSequence};
+use knightty_proto::kitty::KittyFormat;
 use knightty_render::CellMetrics;
 use thiserror::Error;
 
@@ -46,6 +50,20 @@ pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KittyPlacementOptions {
+    pub columns: Option<u16>,
+    pub rows: Option<u16>,
+    pub source_x: Option<u32>,
+    pub source_y: Option<u32>,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
+    pub pixel_offset_x: Option<u16>,
+    pub pixel_offset_y: Option<u16>,
+    pub z_index: i32,
+    pub kitty_image_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,18 +143,45 @@ pub fn decode_png_payload(
     payload: &[u8],
     limits: ImageLimits,
 ) -> Result<DecodedImage, InlineImageError> {
-    if payload.len() > limits.max_encoded_bytes {
-        return Err(InlineImageError::EncodedTooLarge);
-    }
-
-    let compressed = STANDARD
-        .decode(payload)
-        .map_err(|_| InlineImageError::InvalidBase64)?;
+    let compressed = decode_base64_payload(payload, limits)?;
     if compressed.len() > limits.max_encoded_bytes {
         return Err(InlineImageError::CompressedTooLarge);
     }
+    decode_png_bytes(&compressed, limits)
+}
 
-    let rgba = image::load_from_memory_with_format(&compressed, ImageFormat::Png)
+pub fn decode_kitty_image(
+    format: KittyFormat,
+    payload: &[u8],
+    limits: ImageLimits,
+) -> Result<DecodedImage, InlineImageError> {
+    match format {
+        KittyFormat::Png => decode_png_payload(payload, limits),
+        KittyFormat::Rgb24 { width, height } => {
+            let raw = decode_base64_payload(payload, limits)?;
+            decode_raw_image(raw, width, height, 3, limits)
+        }
+        KittyFormat::Rgba32 { width, height } => {
+            let raw = decode_base64_payload(payload, limits)?;
+            decode_raw_image(raw, width, height, 4, limits)
+        }
+    }
+}
+
+fn decode_base64_payload(payload: &[u8], limits: ImageLimits) -> Result<Vec<u8>, InlineImageError> {
+    if payload.len() > limits.max_encoded_bytes {
+        return Err(InlineImageError::EncodedTooLarge);
+    }
+    STANDARD
+        .decode(payload)
+        .map_err(|_| InlineImageError::InvalidBase64)
+}
+
+fn decode_png_bytes(
+    compressed: &[u8],
+    limits: ImageLimits,
+) -> Result<DecodedImage, InlineImageError> {
+    let rgba = image::load_from_memory_with_format(compressed, ImageFormat::Png)
         .map_err(|_| InlineImageError::InvalidPng)?
         .into_rgba8();
     let (width, height) = rgba.dimensions();
@@ -171,37 +216,145 @@ pub fn decode_png_payload(
     })
 }
 
+fn decode_raw_image(
+    raw: Vec<u8>,
+    width: u32,
+    height: u32,
+    channels: u64,
+    limits: ImageLimits,
+) -> Result<DecodedImage, InlineImageError> {
+    if width == 0 || height == 0 {
+        return Err(InlineImageError::ZeroDimension);
+    }
+    if width > limits.max_width || height > limits.max_height {
+        return Err(InlineImageError::DimensionLimit);
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(InlineImageError::SizeOverflow)?;
+    if pixels > limits.max_pixels {
+        return Err(InlineImageError::PixelLimit);
+    }
+    let decoded_bytes = pixels
+        .checked_mul(4)
+        .ok_or(InlineImageError::SizeOverflow)?;
+    if decoded_bytes > limits.max_decoded_bytes as u64 {
+        return Err(InlineImageError::DecodedTooLarge);
+    }
+    let expected_payload_bytes = pixels
+        .checked_mul(channels)
+        .ok_or(InlineImageError::SizeOverflow)?;
+    if raw.len() as u64 != expected_payload_bytes {
+        return Err(InlineImageError::InvalidPayloadLength);
+    }
+
+    let rgba = if channels == 4 {
+        raw
+    } else {
+        let capacity =
+            usize::try_from(decoded_bytes).map_err(|_| InlineImageError::SizeOverflow)?;
+        let mut rgba = Vec::with_capacity(capacity);
+        for pixel in raw.chunks_exact(3) {
+            rgba.extend_from_slice(pixel);
+            rgba.push(255);
+        }
+        rgba
+    };
+    if rgba.len() as u64 != decoded_bytes {
+        return Err(InlineImageError::SizeOverflow);
+    }
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba: Arc::from(rgba),
+    })
+}
+
 pub fn placement_for_kitty(
     id: ImageId,
     placement_id: ImagePlacementId,
     image: &DecodedImage,
-    columns: Option<u16>,
-    rows: Option<u16>,
+    options: KittyPlacementOptions,
     anchor: GridPoint,
     metrics: CellMetrics,
 ) -> Result<ImagePlacement, InlineImageError> {
     if metrics.width == 0 || metrics.height == 0 {
         return Err(InlineImageError::ZeroCellSize);
     }
+    let source_rect = resolve_kitty_source_rect(image, options)?;
+    let pixel_offset = ImagePixelOffset {
+        x: options.pixel_offset_x.unwrap_or(0),
+        y: options.pixel_offset_y.unwrap_or(0),
+    };
+    if u32::from(pixel_offset.x) >= metrics.width || u32::from(pixel_offset.y) >= metrics.height {
+        return Err(InlineImageError::InvalidPixelOffset);
+    }
 
-    let (columns, rows) = match (columns, rows) {
+    let (columns, rows) = match (options.columns, options.rows) {
         (None, None) => (
-            ceil_ratio(u64::from(image.width), u64::from(metrics.width)),
-            ceil_ratio(u64::from(image.height), u64::from(metrics.height)),
+            ceil_ratio(u64::from(source_rect.width), u64::from(metrics.width)),
+            ceil_ratio(u64::from(source_rect.height), u64::from(metrics.height)),
         ),
-        (Some(columns), None) => (columns, rows_for_columns(image, columns, metrics)?),
-        (None, Some(rows)) => (columns_for_rows(image, rows, metrics)?, rows),
+        (Some(columns), None) => (
+            columns,
+            rows_for_dimensions(source_rect.width, source_rect.height, columns, metrics)?,
+        ),
+        (None, Some(rows)) => (
+            columns_for_dimensions(source_rect.width, source_rect.height, rows, metrics)?,
+            rows,
+        ),
         (Some(columns), Some(rows)) => (columns, rows),
     };
 
     Ok(ImagePlacement {
         placement_id,
         image_id: id,
+        kitty_image_id: options.kitty_image_id,
         anchor,
         columns: columns.max(1),
         rows: rows.max(1),
         source_width: image.width,
         source_height: image.height,
+        source_rect,
+        pixel_offset,
+        z_index: ImageZIndex(options.z_index),
+    })
+}
+
+fn resolve_kitty_source_rect(
+    image: &DecodedImage,
+    options: KittyPlacementOptions,
+) -> Result<ImageSourceRect, InlineImageError> {
+    let x = options.source_x.unwrap_or(0);
+    let y = options.source_y.unwrap_or(0);
+    let requested_right = match options.source_width {
+        None | Some(0) => image.width,
+        Some(width) => x
+            .checked_add(width)
+            .ok_or(InlineImageError::InvalidSourceRectangle)?,
+    };
+    let requested_bottom = match options.source_height {
+        None | Some(0) => image.height,
+        Some(height) => y
+            .checked_add(height)
+            .ok_or(InlineImageError::InvalidSourceRectangle)?,
+    };
+    let right = requested_right.min(image.width);
+    let bottom = requested_bottom.min(image.height);
+    let width = right
+        .checked_sub(x)
+        .filter(|width| *width > 0)
+        .ok_or(InlineImageError::InvalidSourceRectangle)?;
+    let height = bottom
+        .checked_sub(y)
+        .filter(|height| *height > 0)
+        .ok_or(InlineImageError::InvalidSourceRectangle)?;
+
+    Ok(ImageSourceRect {
+        x,
+        y,
+        width,
+        height,
     })
 }
 
@@ -258,11 +411,20 @@ pub fn placement_for_image(
     Ok(ImagePlacement {
         placement_id,
         image_id: id,
+        kitty_image_id: None,
         anchor,
         columns: columns.max(1),
         rows: rows.max(1),
         source_width: image.width,
         source_height: image.height,
+        source_rect: ImageSourceRect {
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height,
+        },
+        pixel_offset: ImagePixelOffset::default(),
+        z_index: ImageZIndex::default(),
     })
 }
 
@@ -317,11 +479,20 @@ fn rows_for_columns(
     columns: u16,
     metrics: CellMetrics,
 ) -> Result<u16, InlineImageError> {
+    rows_for_dimensions(image.width, image.height, columns, metrics)
+}
+
+fn rows_for_dimensions(
+    image_width: u32,
+    image_height: u32,
+    columns: u16,
+    metrics: CellMetrics,
+) -> Result<u16, InlineImageError> {
     let numerator = u64::from(columns)
         .checked_mul(u64::from(metrics.width))
-        .and_then(|value| value.checked_mul(u64::from(image.height)))
+        .and_then(|value| value.checked_mul(u64::from(image_height)))
         .ok_or(InlineImageError::SizeOverflow)?;
-    let denominator = u64::from(image.width)
+    let denominator = u64::from(image_width)
         .checked_mul(u64::from(metrics.height))
         .ok_or(InlineImageError::SizeOverflow)?;
     Ok(ceil_ratio(numerator, denominator))
@@ -332,11 +503,20 @@ fn columns_for_rows(
     rows: u16,
     metrics: CellMetrics,
 ) -> Result<u16, InlineImageError> {
+    columns_for_dimensions(image.width, image.height, rows, metrics)
+}
+
+fn columns_for_dimensions(
+    image_width: u32,
+    image_height: u32,
+    rows: u16,
+    metrics: CellMetrics,
+) -> Result<u16, InlineImageError> {
     let numerator = u64::from(rows)
         .checked_mul(u64::from(metrics.height))
-        .and_then(|value| value.checked_mul(u64::from(image.width)))
+        .and_then(|value| value.checked_mul(u64::from(image_width)))
         .ok_or(InlineImageError::SizeOverflow)?;
-    let denominator = u64::from(image.height)
+    let denominator = u64::from(image_height)
         .checked_mul(u64::from(metrics.width))
         .ok_or(InlineImageError::SizeOverflow)?;
     Ok(ceil_ratio(numerator, denominator))
@@ -380,6 +560,8 @@ pub enum InlineImageError {
     InvalidBase64,
     #[error("image payload is not a valid PNG")]
     InvalidPng,
+    #[error("raw image payload length does not match its dimensions")]
+    InvalidPayloadLength,
     #[error("image has a zero dimension")]
     ZeroDimension,
     #[error("image dimensions exceed the configured limit")]
@@ -392,6 +574,10 @@ pub enum InlineImageError {
     SizeOverflow,
     #[error("terminal cell size is zero")]
     ZeroCellSize,
+    #[error("image source rectangle does not intersect the image")]
+    InvalidSourceRectangle,
+    #[error("image pixel offset is outside the anchor cell")]
+    InvalidPixelOffset,
 }
 
 #[cfg(test)]
@@ -400,11 +586,12 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use knightty_core::{GridPoint, ImageId, ImagePlacementId};
     use knightty_proto::iterm2::parse_iterm2_inline_image;
+    use knightty_proto::kitty::KittyFormat;
     use knightty_render::CellMetrics;
 
     use super::{
-        ImageLimits, InlineImageError, PtyStreamItem, decode_png, placement_for_image,
-        placement_for_kitty, scan_pty_stream,
+        ImageLimits, InlineImageError, KittyPlacementOptions, PtyStreamItem, decode_kitty_image,
+        decode_png, placement_for_image, placement_for_kitty, scan_pty_stream,
     };
 
     const TRANSPARENT_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -476,6 +663,143 @@ mod tests {
         assert_eq!(
             decode_png(&invalid_png, limits()).unwrap_err(),
             InlineImageError::InvalidPng
+        );
+    }
+
+    #[test]
+    fn raw_rgb_expands_to_opaque_rgba_and_rgba_preserves_straight_alpha() {
+        let rgb = STANDARD.encode([10, 20, 30]);
+        let image = decode_kitty_image(
+            KittyFormat::Rgb24 {
+                width: 1,
+                height: 1,
+            },
+            rgb.as_bytes(),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(&*image.rgba, &[10, 20, 30, 255]);
+
+        let rgba_bytes = [
+            1, 2, 3, 0, // transparent
+            4, 5, 6, 128, // translucent
+            7, 8, 9, 255, // opaque
+        ];
+        let rgba = STANDARD.encode(rgba_bytes);
+        let image = decode_kitty_image(
+            KittyFormat::Rgba32 {
+                width: 3,
+                height: 1,
+            },
+            rgba.as_bytes(),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(&*image.rgba, &rgba_bytes);
+    }
+
+    #[test]
+    fn raw_payload_requires_valid_base64_and_exact_decoded_length() {
+        assert_eq!(
+            decode_kitty_image(
+                KittyFormat::Rgb24 {
+                    width: 1,
+                    height: 1,
+                },
+                b"***",
+                limits(),
+            )
+            .unwrap_err(),
+            InlineImageError::InvalidBase64
+        );
+
+        for raw in [[1, 2].as_slice(), [1, 2, 3, 4].as_slice()] {
+            let payload = STANDARD.encode(raw);
+            assert_eq!(
+                decode_kitty_image(
+                    KittyFormat::Rgb24 {
+                        width: 1,
+                        height: 1,
+                    },
+                    payload.as_bytes(),
+                    limits(),
+                )
+                .unwrap_err(),
+                InlineImageError::InvalidPayloadLength
+            );
+        }
+    }
+
+    #[test]
+    fn raw_dimensions_pixels_decoded_bytes_and_overflow_are_bounded() {
+        let rgba = STANDARD.encode([1, 2, 3, 4]);
+
+        let mut restricted = limits();
+        restricted.max_width = 0;
+        assert_eq!(
+            decode_kitty_image(
+                KittyFormat::Rgba32 {
+                    width: 1,
+                    height: 1,
+                },
+                rgba.as_bytes(),
+                restricted,
+            )
+            .unwrap_err(),
+            InlineImageError::DimensionLimit
+        );
+
+        let mut restricted = limits();
+        restricted.max_pixels = 0;
+        assert_eq!(
+            decode_kitty_image(
+                KittyFormat::Rgba32 {
+                    width: 1,
+                    height: 1,
+                },
+                rgba.as_bytes(),
+                restricted,
+            )
+            .unwrap_err(),
+            InlineImageError::PixelLimit
+        );
+
+        let mut restricted = limits();
+        restricted.max_decoded_bytes = 3;
+        assert_eq!(
+            decode_kitty_image(
+                KittyFormat::Rgba32 {
+                    width: 1,
+                    height: 1,
+                },
+                rgba.as_bytes(),
+                restricted,
+            )
+            .unwrap_err(),
+            InlineImageError::DecodedTooLarge
+        );
+
+        let unbounded = ImageLimits {
+            max_encoded_bytes: usize::MAX,
+            max_decoded_bytes: usize::MAX,
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            max_pixels: u64::MAX,
+            max_images: usize::MAX,
+            max_gpu_bytes: usize::MAX,
+        };
+        assert_eq!(
+            decode_kitty_image(
+                KittyFormat::Rgba32 {
+                    width: u32::MAX,
+                    height: u32::MAX,
+                },
+                b"",
+                unbounded,
+            )
+            .unwrap_err(),
+            InlineImageError::SizeOverflow
         );
     }
 
@@ -652,8 +976,11 @@ mod tests {
             ImageId::new(1),
             ImagePlacementId::new(1),
             &image,
-            Some(10),
-            Some(2),
+            KittyPlacementOptions {
+                columns: Some(10),
+                rows: Some(2),
+                ..KittyPlacementOptions::default()
+            },
             GridPoint { col: 0, row: 0 },
             CellMetrics {
                 width: 10,
@@ -679,8 +1006,10 @@ mod tests {
             ImageId::new(1),
             ImagePlacementId::new(1),
             &image,
-            Some(10),
-            None,
+            KittyPlacementOptions {
+                columns: Some(10),
+                ..KittyPlacementOptions::default()
+            },
             GridPoint { col: 0, row: 0 },
             CellMetrics {
                 width: 10,
@@ -692,6 +1021,181 @@ mod tests {
         .expect("Kitty placement is valid");
 
         assert_eq!((placement.columns, placement.rows), (10, 3));
+    }
+
+    #[test]
+    fn kitty_source_rectangle_intersects_bounds_and_zero_extends_to_edges() {
+        let image = super::DecodedImage {
+            width: 100,
+            height: 80,
+            rgba: std::sync::Arc::from(vec![0; 100 * 80 * 4]),
+        };
+        let metrics = CellMetrics {
+            width: 10,
+            height: 10,
+            font_size: 10.0,
+            line_height: 10.0,
+        };
+
+        let clipped = placement_for_kitty(
+            ImageId::new(1),
+            ImagePlacementId::new(1),
+            &image,
+            KittyPlacementOptions {
+                source_x: Some(70),
+                source_y: Some(60),
+                source_width: Some(50),
+                source_height: Some(50),
+                ..KittyPlacementOptions::default()
+            },
+            GridPoint { col: 0, row: 0 },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            clipped.source_rect,
+            knightty_core::ImageSourceRect {
+                x: 70,
+                y: 60,
+                width: 30,
+                height: 20,
+            }
+        );
+        assert_eq!((clipped.columns, clipped.rows), (3, 2));
+
+        let to_edges = placement_for_kitty(
+            ImageId::new(1),
+            ImagePlacementId::new(2),
+            &image,
+            KittyPlacementOptions {
+                source_x: Some(25),
+                source_y: Some(30),
+                source_width: Some(0),
+                source_height: Some(0),
+                ..KittyPlacementOptions::default()
+            },
+            GridPoint { col: 0, row: 0 },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            (to_edges.source_rect.width, to_edges.source_rect.height),
+            (75, 50)
+        );
+    }
+
+    #[test]
+    fn kitty_crop_drives_aspect_ratio_and_invalid_intersections_are_rejected() {
+        let image = super::DecodedImage {
+            width: 100,
+            height: 80,
+            rgba: std::sync::Arc::from(vec![0; 100 * 80 * 4]),
+        };
+        let metrics = CellMetrics {
+            width: 10,
+            height: 10,
+            font_size: 10.0,
+            line_height: 10.0,
+        };
+        let cropped = placement_for_kitty(
+            ImageId::new(1),
+            ImagePlacementId::new(1),
+            &image,
+            KittyPlacementOptions {
+                columns: Some(10),
+                source_height: Some(20),
+                ..KittyPlacementOptions::default()
+            },
+            GridPoint { col: 0, row: 0 },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!((cropped.columns, cropped.rows), (10, 2));
+
+        for options in [
+            KittyPlacementOptions {
+                source_x: Some(100),
+                ..KittyPlacementOptions::default()
+            },
+            KittyPlacementOptions {
+                source_y: Some(80),
+                ..KittyPlacementOptions::default()
+            },
+            KittyPlacementOptions {
+                source_x: Some(u32::MAX),
+                source_width: Some(2),
+                ..KittyPlacementOptions::default()
+            },
+        ] {
+            assert_eq!(
+                placement_for_kitty(
+                    ImageId::new(1),
+                    ImagePlacementId::new(1),
+                    &image,
+                    options,
+                    GridPoint { col: 0, row: 0 },
+                    metrics,
+                )
+                .unwrap_err(),
+                InlineImageError::InvalidSourceRectangle
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_pixel_offset_validates_only_against_current_cell_size() {
+        let image = super::DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: std::sync::Arc::from(vec![0; 4]),
+        };
+        let metrics = CellMetrics {
+            width: 10,
+            height: 20,
+            font_size: 16.0,
+            line_height: 20.0,
+        };
+        let placement = placement_for_kitty(
+            ImageId::new(1),
+            ImagePlacementId::new(1),
+            &image,
+            KittyPlacementOptions {
+                pixel_offset_x: Some(9),
+                pixel_offset_y: Some(19),
+                ..KittyPlacementOptions::default()
+            },
+            GridPoint { col: 0, row: 0 },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            (placement.pixel_offset.x, placement.pixel_offset.y),
+            (9, 19)
+        );
+
+        for options in [
+            KittyPlacementOptions {
+                pixel_offset_x: Some(10),
+                ..KittyPlacementOptions::default()
+            },
+            KittyPlacementOptions {
+                pixel_offset_y: Some(20),
+                ..KittyPlacementOptions::default()
+            },
+        ] {
+            assert_eq!(
+                placement_for_kitty(
+                    ImageId::new(1),
+                    ImagePlacementId::new(1),
+                    &image,
+                    options,
+                    GridPoint { col: 0, row: 0 },
+                    metrics,
+                )
+                .unwrap_err(),
+                InlineImageError::InvalidPixelOffset
+            );
+        }
     }
 
     #[test]

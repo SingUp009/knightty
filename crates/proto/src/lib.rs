@@ -307,6 +307,8 @@ pub mod kitty {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum KittyFormat {
         Png,
+        Rgb24 { width: u32, height: u32 },
+        Rgba32 { width: u32, height: u32 },
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +325,48 @@ pub mod kitty {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum KittyDeleteSelector {
+        All {
+            hard: bool,
+        },
+        Image {
+            hard: bool,
+            image_id: KittyImageKey,
+            placement_id: Option<u32>,
+        },
+        Cell {
+            hard: bool,
+            column: u32,
+            row: u32,
+        },
+        Column {
+            hard: bool,
+            column: u32,
+        },
+        Row {
+            hard: bool,
+            row: u32,
+        },
+        ZIndex {
+            hard: bool,
+            z_index: i32,
+        },
+    }
+
+    impl KittyDeleteSelector {
+        pub const fn is_hard(self) -> bool {
+            match self {
+                Self::All { hard }
+                | Self::Image { hard, .. }
+                | Self::Cell { hard, .. }
+                | Self::Column { hard, .. }
+                | Self::Row { hard, .. }
+                | Self::ZIndex { hard, .. } => hard,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct KittyCommand<'a> {
         pub action: KittyAction,
         pub format: KittyFormat,
@@ -331,9 +375,17 @@ pub mod kitty {
         pub placement_id: Option<u32>,
         pub columns: Option<u16>,
         pub rows: Option<u16>,
+        pub source_x: Option<u32>,
+        pub source_y: Option<u32>,
+        pub source_width: Option<u32>,
+        pub source_height: Option<u32>,
+        pub pixel_offset_x: Option<u16>,
+        pub pixel_offset_y: Option<u16>,
+        pub z_index: i32,
         pub cursor_movement: bool,
         pub quiet: KittyQuiet,
         pub more_chunks: bool,
+        pub delete_selector: Option<KittyDeleteSelector>,
         pub payload: &'a [u8],
     }
 
@@ -463,12 +515,21 @@ pub mod kitty {
         let mut placement_id = None;
         let mut columns = None;
         let mut rows = None;
+        let mut source_x = None;
+        let mut source_y = None;
+        let mut source_width = None;
+        let mut source_height = None;
+        let mut pixel_offset_x = None;
+        let mut pixel_offset_y = None;
+        let mut source_pixel_width = None;
+        let mut source_pixel_height = None;
+        let mut z_index = 0;
         let mut cursor_movement = true;
         let mut quiet = KittyQuiet::Normal;
         let mut quiet_override = None;
         let mut more_chunks = false;
-        let mut delete_selector = b'a';
-        let mut seen = 0_u16;
+        let mut raw_delete_selector = b'a';
+        let mut seen = 0_u32;
         let mut continuation_control_only = true;
 
         if !control.is_empty() {
@@ -496,6 +557,15 @@ pub mod kitty {
                     b"q" => Some(1 << 8),
                     b"m" => Some(1 << 9),
                     b"d" => Some(1 << 10),
+                    b"x" => Some(1 << 11),
+                    b"y" => Some(1 << 12),
+                    b"w" => Some(1 << 13),
+                    b"h" => Some(1 << 14),
+                    b"X" => Some(1 << 15),
+                    b"Y" => Some(1 << 16),
+                    b"z" => Some(1 << 17),
+                    b"s" => Some(1 << 18),
+                    b"v" => Some(1 << 19),
                     _ => None,
                 };
                 if let Some(bit) = bit {
@@ -523,6 +593,15 @@ pub mod kitty {
                     b"p" => placement_id = nonzero_u32(value)?,
                     b"c" => columns = optional_u16(value)?,
                     b"r" => rows = optional_u16(value)?,
+                    b"x" => source_x = Some(parse_u32(value)?),
+                    b"y" => source_y = Some(parse_u32(value)?),
+                    b"w" => source_width = Some(parse_u32(value)?),
+                    b"h" => source_height = Some(parse_u32(value)?),
+                    b"X" => pixel_offset_x = Some(parse_u16(value)?),
+                    b"Y" => pixel_offset_y = Some(parse_u16(value)?),
+                    b"z" => z_index = parse_i32(value)?,
+                    b"s" => source_pixel_width = Some(parse_u32(value)?),
+                    b"v" => source_pixel_height = Some(parse_u32(value)?),
                     b"C" => {
                         cursor_movement = match parse_u32(value)? {
                             0 => true,
@@ -546,9 +625,8 @@ pub mod kitty {
                             _ => return Err(KittyParseError::InvalidValue),
                         };
                     }
-                    b"d" => delete_selector = single_byte(value)?,
-                    b"s" | b"v" | b"S" | b"O" | b"I" | b"o" | b"N" | b"x" | b"y" | b"w" | b"h"
-                    | b"X" | b"Y" | b"U" | b"z" | b"P" | b"Q" | b"H" | b"V" => {
+                    b"d" => raw_delete_selector = single_byte(value)?,
+                    b"S" | b"O" | b"I" | b"o" | b"N" | b"U" | b"P" | b"Q" | b"H" | b"V" => {
                         return Err(KittyParseError::UnsupportedFeature);
                     }
                     _ => {}
@@ -571,11 +649,27 @@ pub mod kitty {
         if transmission != b'd' {
             return Err(KittyParseError::UnsupportedFeature);
         }
+        let mut parsed_format = KittyFormat::Png;
+        let mut delete_selector = None;
         match action {
             KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
-                if format != 100 {
-                    return Err(KittyParseError::UnsupportedFeature);
-                }
+                parsed_format = match format {
+                    100 => KittyFormat::Png,
+                    24 | 32 => {
+                        let width = source_pixel_width
+                            .filter(|width| *width > 0)
+                            .ok_or(KittyParseError::InvalidValue)?;
+                        let height = source_pixel_height
+                            .filter(|height| *height > 0)
+                            .ok_or(KittyParseError::InvalidValue)?;
+                        if format == 24 {
+                            KittyFormat::Rgb24 { width, height }
+                        } else {
+                            KittyFormat::Rgba32 { width, height }
+                        }
+                    }
+                    _ => return Err(KittyParseError::UnsupportedFeature),
+                };
                 if more_chunks && image_id.is_none() {
                     return Err(KittyParseError::MissingImageId);
                 }
@@ -595,32 +689,63 @@ pub mod kitty {
                 }
             }
             KittyAction::Delete => {
-                if more_chunks {
+                if has_more_key {
                     return Err(KittyParseError::UnsupportedFeature);
-                }
-                if delete_selector != b'i' {
-                    return Err(KittyParseError::UnsupportedFeature);
-                }
-                if image_id.is_none() {
-                    return Err(KittyParseError::MissingImageId);
                 }
                 if !payload.is_empty() {
                     return Err(KittyParseError::UnexpectedPayload);
                 }
+                let hard = raw_delete_selector.is_ascii_uppercase();
+                delete_selector = Some(match raw_delete_selector.to_ascii_lowercase() {
+                    b'a' => KittyDeleteSelector::All { hard },
+                    b'i' => KittyDeleteSelector::Image {
+                        hard,
+                        image_id: image_id.ok_or(KittyParseError::MissingImageId)?,
+                        placement_id,
+                    },
+                    b'p' => KittyDeleteSelector::Cell {
+                        hard,
+                        column: required_screen_coordinate(source_x)?,
+                        row: required_screen_coordinate(source_y)?,
+                    },
+                    b'x' => KittyDeleteSelector::Column {
+                        hard,
+                        column: required_screen_coordinate(source_x)?,
+                    },
+                    b'y' => KittyDeleteSelector::Row {
+                        hard,
+                        row: required_screen_coordinate(source_y)?,
+                    },
+                    b'z' => {
+                        if seen & (1 << 17) == 0 {
+                            return Err(KittyParseError::InvalidValue);
+                        }
+                        KittyDeleteSelector::ZIndex { hard, z_index }
+                    }
+                    _ => return Err(KittyParseError::UnsupportedFeature),
+                });
             }
         }
 
         Ok(ParsedKittyCommand::Command(KittyCommand {
             action,
-            format: KittyFormat::Png,
+            format: parsed_format,
             transmission: KittyTransmission::Direct,
             image_id,
             placement_id,
             columns,
             rows,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            pixel_offset_x,
+            pixel_offset_y,
+            z_index,
             cursor_movement,
             quiet,
             more_chunks,
+            delete_selector,
             payload,
         }))
     }
@@ -701,6 +826,43 @@ pub mod kitty {
         Ok(parsed)
     }
 
+    fn parse_i32(value: &[u8]) -> Result<i32, KittyParseError> {
+        if value.is_empty() {
+            return Err(KittyParseError::InvalidValue);
+        }
+        let (negative, digits) = match value[0] {
+            b'-' => (true, &value[1..]),
+            b'+' => (false, &value[1..]),
+            _ => (false, value),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(KittyParseError::InvalidValue);
+        }
+
+        let mut magnitude = 0_u32;
+        for byte in digits {
+            magnitude = magnitude
+                .checked_mul(10)
+                .and_then(|number| number.checked_add(u32::from(*byte - b'0')))
+                .ok_or(KittyParseError::InvalidValue)?;
+        }
+        if negative {
+            if magnitude == i32::MAX as u32 + 1 {
+                Ok(i32::MIN)
+            } else {
+                i32::try_from(magnitude)
+                    .map(|number| -number)
+                    .map_err(|_| KittyParseError::InvalidValue)
+            }
+        } else {
+            i32::try_from(magnitude).map_err(|_| KittyParseError::InvalidValue)
+        }
+    }
+
+    fn parse_u16(value: &[u8]) -> Result<u16, KittyParseError> {
+        u16::try_from(parse_u32(value)?).map_err(|_| KittyParseError::InvalidValue)
+    }
+
     fn nonzero_u32(value: &[u8]) -> Result<Option<u32>, KittyParseError> {
         Ok(match parse_u32(value)? {
             0 => None,
@@ -717,6 +879,12 @@ pub mod kitty {
                 .map(Some)
                 .map_err(|_| KittyParseError::InvalidValue)
         }
+    }
+
+    fn required_screen_coordinate(value: Option<u32>) -> Result<u32, KittyParseError> {
+        value
+            .filter(|value| *value > 0)
+            .ok_or(KittyParseError::InvalidValue)
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -909,9 +1077,10 @@ pub mod kitty {
     #[cfg(test)]
     mod tests {
         use super::{
-            GraphicsEscapeRouter, GraphicsStreamItem, KittyAction, KittyErrorCode, KittyParseError,
-            KittyProtocolError, KittyQuiet, KittyResponseContext, ParsedKittyCommand,
-            encode_response, parse_kitty_command, response_context,
+            GraphicsEscapeRouter, GraphicsStreamItem, KittyAction, KittyDeleteSelector,
+            KittyErrorCode, KittyFormat, KittyImageKey, KittyParseError, KittyProtocolError,
+            KittyQuiet, KittyResponseContext, ParsedKittyCommand, encode_response,
+            parse_kitty_command, response_context,
         };
 
         fn command(input: &[u8]) -> super::KittyCommand<'_> {
@@ -1001,6 +1170,7 @@ pub mod kitty {
         fn transmit_place_and_delete_commands_parse() {
             let transmit = command(b"a=T,f=100,t=d,i=42,p=7,c=10,r=5,C=1,q=1,m=0;AAAA");
             assert_eq!(transmit.action, KittyAction::TransmitAndDisplay);
+            assert_eq!(transmit.format, KittyFormat::Png);
             assert_eq!(transmit.image_id.unwrap().client_id, 42);
             assert_eq!(transmit.placement_id, Some(7));
             assert_eq!(transmit.columns, Some(10));
@@ -1010,7 +1180,250 @@ pub mod kitty {
             assert!(!transmit.more_chunks);
 
             assert_eq!(command(b"a=p,i=42").action, KittyAction::Place);
-            assert_eq!(command(b"a=d,d=i,i=42").action, KittyAction::Delete);
+            let delete = command(b"a=d,d=i,i=42");
+            assert_eq!(delete.action, KittyAction::Delete);
+            assert_eq!(
+                delete.delete_selector,
+                Some(KittyDeleteSelector::Image {
+                    hard: false,
+                    image_id: KittyImageKey { client_id: 42 },
+                    placement_id: None,
+                })
+            );
+        }
+
+        #[test]
+        fn delete_selectors_parse_with_typed_arguments_and_case_sensitive_hardness() {
+            let cases = [
+                (b"a=d".as_slice(), KittyDeleteSelector::All { hard: false }),
+                (b"a=d,d=A", KittyDeleteSelector::All { hard: true }),
+                (
+                    b"a=d,d=i,i=42,p=7",
+                    KittyDeleteSelector::Image {
+                        hard: false,
+                        image_id: KittyImageKey { client_id: 42 },
+                        placement_id: Some(7),
+                    },
+                ),
+                (
+                    b"a=d,d=I,i=42",
+                    KittyDeleteSelector::Image {
+                        hard: true,
+                        image_id: KittyImageKey { client_id: 42 },
+                        placement_id: None,
+                    },
+                ),
+                (
+                    b"a=d,d=p,x=1,y=2",
+                    KittyDeleteSelector::Cell {
+                        hard: false,
+                        column: 1,
+                        row: 2,
+                    },
+                ),
+                (
+                    b"a=d,d=P,x=3,y=4",
+                    KittyDeleteSelector::Cell {
+                        hard: true,
+                        column: 3,
+                        row: 4,
+                    },
+                ),
+                (
+                    b"a=d,d=x,x=5",
+                    KittyDeleteSelector::Column {
+                        hard: false,
+                        column: 5,
+                    },
+                ),
+                (
+                    b"a=d,d=X,x=6",
+                    KittyDeleteSelector::Column {
+                        hard: true,
+                        column: 6,
+                    },
+                ),
+                (
+                    b"a=d,d=y,y=7",
+                    KittyDeleteSelector::Row {
+                        hard: false,
+                        row: 7,
+                    },
+                ),
+                (
+                    b"a=d,d=Y,y=8",
+                    KittyDeleteSelector::Row { hard: true, row: 8 },
+                ),
+                (
+                    b"a=d,d=z,z=-9",
+                    KittyDeleteSelector::ZIndex {
+                        hard: false,
+                        z_index: -9,
+                    },
+                ),
+                (
+                    b"a=d,d=Z,z=0",
+                    KittyDeleteSelector::ZIndex {
+                        hard: true,
+                        z_index: 0,
+                    },
+                ),
+            ];
+
+            for (input, expected) in cases {
+                let parsed = command(input);
+                assert_eq!(parsed.delete_selector, Some(expected), "{input:?}");
+                assert_eq!(
+                    expected.is_hard(),
+                    matches!(
+                        expected,
+                        KittyDeleteSelector::All { hard: true }
+                            | KittyDeleteSelector::Image { hard: true, .. }
+                            | KittyDeleteSelector::Cell { hard: true, .. }
+                            | KittyDeleteSelector::Column { hard: true, .. }
+                            | KittyDeleteSelector::Row { hard: true, .. }
+                            | KittyDeleteSelector::ZIndex { hard: true, .. }
+                    )
+                );
+            }
+        }
+
+        #[test]
+        fn delete_selector_validation_is_atomic_and_rejects_missing_or_invalid_controls() {
+            for input in [
+                b"a=d,d=i".as_slice(),
+                b"a=d,d=I,i=0",
+                b"a=d,d=p,x=1",
+                b"a=d,d=p,y=1",
+                b"a=d,d=p,x=0,y=1",
+                b"a=d,d=x",
+                b"a=d,d=x,x=0",
+                b"a=d,d=y",
+                b"a=d,d=y,y=0",
+                b"a=d,d=z",
+            ] {
+                assert!(parse_kitty_command(input).is_err(), "{input:?}");
+            }
+            assert_eq!(
+                parse_kitty_command(b"a=d,d=?").unwrap_err(),
+                KittyParseError::UnsupportedFeature
+            );
+            assert_eq!(
+                parse_kitty_command(b"a=d,d=i,i=1,m=0").unwrap_err(),
+                KittyParseError::UnsupportedFeature
+            );
+            assert_eq!(
+                parse_kitty_command(b"a=d,d=i,i=1;AAAA").unwrap_err(),
+                KittyParseError::UnexpectedPayload
+            );
+            assert_eq!(
+                parse_kitty_command(b"a=d,d=x,x=4294967296").unwrap_err(),
+                KittyParseError::InvalidValue
+            );
+        }
+
+        #[test]
+        fn raw_rgb_rgba_and_default_format_parse_with_source_dimensions() {
+            assert_eq!(
+                command(b"a=t,f=24,s=2,v=3,i=1;AAAA").format,
+                KittyFormat::Rgb24 {
+                    width: 2,
+                    height: 3,
+                }
+            );
+            assert_eq!(
+                command(b"a=t,f=32,s=4,v=5,i=1;AAAA").format,
+                KittyFormat::Rgba32 {
+                    width: 4,
+                    height: 5,
+                }
+            );
+            assert_eq!(
+                command(b"a=t,s=6,v=7,i=1;AAAA").format,
+                KittyFormat::Rgba32 {
+                    width: 6,
+                    height: 7,
+                }
+            );
+
+            assert_eq!(
+                command(b"a=t,f=100,s=8,v=9,i=1;AAAA").format,
+                KittyFormat::Png
+            );
+            assert_eq!(command(b"a=t,f=100,i=1;AAAA").format, KittyFormat::Png);
+        }
+
+        #[test]
+        fn raw_formats_require_nonzero_dimensions_and_validate_dimension_keys() {
+            for input in [
+                b"a=t,f=24,v=1,i=1;AAAA".as_slice(),
+                b"a=t,f=24,s=1,i=1;AAAA",
+                b"a=t,f=32,s=0,v=1,i=1;AAAA",
+                b"a=t,f=32,s=1,v=0,i=1;AAAA",
+                b"a=t,f=32,s=4294967296,v=1,i=1;AAAA",
+            ] {
+                assert_eq!(
+                    parse_kitty_command(input).unwrap_err(),
+                    KittyParseError::InvalidValue
+                );
+            }
+            for input in [
+                b"a=t,f=24,s=1,s=2,v=1,i=1;AAAA".as_slice(),
+                b"a=t,f=32,s=1,v=1,v=2,i=1;AAAA",
+            ] {
+                assert_eq!(
+                    parse_kitty_command(input).unwrap_err(),
+                    KittyParseError::DuplicateKey
+                );
+            }
+        }
+
+        #[test]
+        fn source_rect_pixel_offsets_and_signed_z_parse_case_sensitively() {
+            let placement = command(b"a=p,i=42,x=1,y=2,w=0,h=4,X=5,Y=6,z=-7");
+            assert_eq!(placement.source_x, Some(1));
+            assert_eq!(placement.source_y, Some(2));
+            assert_eq!(placement.source_width, Some(0));
+            assert_eq!(placement.source_height, Some(4));
+            assert_eq!(placement.pixel_offset_x, Some(5));
+            assert_eq!(placement.pixel_offset_y, Some(6));
+            assert_eq!(placement.z_index, -7);
+
+            let origin_defaults = command(b"a=p,i=42,w=8,h=9,z=+3");
+            assert_eq!(origin_defaults.source_x, None);
+            assert_eq!(origin_defaults.source_y, None);
+            assert_eq!(origin_defaults.source_width, Some(8));
+            assert_eq!(origin_defaults.source_height, Some(9));
+            assert_eq!(origin_defaults.z_index, 3);
+
+            let edge_defaults = command(b"a=p,i=42,x=8,y=9,z=0");
+            assert_eq!(edge_defaults.source_x, Some(8));
+            assert_eq!(edge_defaults.source_y, Some(9));
+            assert_eq!(edge_defaults.source_width, None);
+            assert_eq!(edge_defaults.source_height, None);
+            assert_eq!(edge_defaults.z_index, 0);
+        }
+
+        #[test]
+        fn f4_integer_validation_rejects_invalid_values_overflow_and_duplicates() {
+            for input in [
+                b"a=p,i=1,x=-1".as_slice(),
+                b"a=p,i=1,x=4294967296",
+                b"a=p,i=1,X=65536",
+                b"a=p,i=1,z=2147483648",
+                b"a=p,i=1,z=-2147483649",
+                b"a=p,i=1,z=+",
+            ] {
+                assert_eq!(
+                    parse_kitty_command(input).unwrap_err(),
+                    KittyParseError::InvalidValue
+                );
+            }
+            assert_eq!(
+                parse_kitty_command(b"a=p,i=1,x=1,x=2").unwrap_err(),
+                KittyParseError::DuplicateKey
+            );
+            assert_eq!(command(b"a=p,i=1,z=-2147483648").z_index, i32::MIN);
         }
 
         #[test]
@@ -1044,7 +1457,7 @@ pub mod kitty {
         #[test]
         fn parser_rejects_invalid_known_values_and_unsupported_features() {
             assert_eq!(
-                parse_kitty_command(b"a=T,f=24,i=1;AAAA").unwrap_err(),
+                parse_kitty_command(b"a=T,f=99,i=1;AAAA").unwrap_err(),
                 KittyParseError::UnsupportedFeature
             );
             assert_eq!(
@@ -1059,10 +1472,7 @@ pub mod kitty {
                 parse_kitty_command(b"a=p,i=1,i=2").unwrap_err(),
                 KittyParseError::DuplicateKey
             );
-            assert_eq!(
-                parse_kitty_command(b"a=p,i=1,z=2").unwrap_err(),
-                KittyParseError::UnsupportedFeature
-            );
+            assert_eq!(command(b"a=p,i=1,z=2").z_index, 2);
             assert_eq!(
                 parse_kitty_command(b"a=p,i=1,m=1;").unwrap_err(),
                 KittyParseError::UnsupportedFeature
@@ -1072,7 +1482,7 @@ pub mod kitty {
                 KittyParseError::MalformedControlData
             );
             assert_eq!(
-                parse_kitty_command(b"m=1,custom=value;AAAA").unwrap_err(),
+                parse_kitty_command(b"f=99,m=1,custom=value;AAAA").unwrap_err(),
                 KittyParseError::UnsupportedFeature
             );
         }

@@ -76,7 +76,7 @@ pub fn record_decode_success(encoded_bytes: usize, width: u32, height: u32) {
     }
     let total = DECODE_SUCCESSES.fetch_add(1, Ordering::Relaxed) + 1;
     eprintln!(
-        "knightty graphics diag: png-decode success=1 total={} encoded_bytes={} dimensions={}x{}",
+        "knightty graphics diag: image-decode success=1 total={} encoded_bytes={} dimensions={}x{}",
         total, encoded_bytes, width, height
     );
 }

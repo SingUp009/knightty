@@ -10,7 +10,7 @@
 //! assert_eq!(grid.cell(0, 0).ch, 'h');
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -166,16 +166,40 @@ pub struct GridPoint {
     pub row: isize,
 }
 
+/// Pixel rectangle selected from an image resource for one placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageSourceRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Pixel offset from the top-left corner of a placement's anchor cell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImagePixelOffset {
+    pub x: u16,
+    pub y: u16,
+}
+
+/// Kitty-compatible image stacking order for one placement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImageZIndex(pub i32);
+
 /// Logical cell placement for one externally-owned image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImagePlacement {
     pub placement_id: ImagePlacementId,
     pub image_id: ImageId,
+    pub kitty_image_id: Option<u32>,
     pub anchor: GridPoint,
     pub columns: u16,
     pub rows: u16,
     pub source_width: u32,
     pub source_height: u32,
+    pub source_rect: ImageSourceRect,
+    pub pixel_offset: ImagePixelOffset,
+    pub z_index: ImageZIndex,
 }
 
 impl Terminal {
@@ -281,6 +305,19 @@ impl Terminal {
         }
     }
 
+    /// Remove a pre-resolved set of logical placements in one atomic update.
+    pub fn remove_image_placements_by_ids(&mut self, placement_ids: &BTreeSet<ImagePlacementId>) {
+        if placement_ids.is_empty() {
+            return;
+        }
+        let previous_len = self.image_placements.len();
+        self.image_placements
+            .retain(|placement| !placement_ids.contains(&placement.placement_id));
+        if self.image_placements.len() != previous_len {
+            self.mark_full_damage();
+        }
+    }
+
     /// Remove every image placement.
     pub fn clear_image_placements(&mut self) {
         if !self.image_placements.is_empty() {
@@ -301,6 +338,11 @@ impl Terminal {
         self.image_placements
             .iter()
             .map(|placement| placement.placement_id)
+    }
+
+    /// Return placements in live-screen logical coordinates before viewport transforms.
+    pub fn logical_image_placements(&self) -> &[ImagePlacement] {
+        &self.image_placements
     }
 
     /// Advance the terminal cursor after displaying a block image.
@@ -1676,11 +1718,12 @@ fn merge_damage(current: Damage, next: Damage) -> Damage {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, Damage, GridPoint, ImageId, ImagePlacement, ImagePlacementId,
-        MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URI_BYTES, MAX_WINDOW_TITLE_CHARS, MouseButton,
-        MouseEncoding, MouseEventKind, MouseModes, MouseProtocol, SelectionMode, SelectionPoint,
-        SelectionRect, Terminal, TerminalMouseEvent,
+        Color, Damage, GridPoint, ImageId, ImagePixelOffset, ImagePlacement, ImagePlacementId,
+        ImageSourceRect, ImageZIndex, MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URI_BYTES,
+        MAX_WINDOW_TITLE_CHARS, MouseButton, MouseEncoding, MouseEventKind, MouseModes,
+        MouseProtocol, SelectionMode, SelectionPoint, SelectionRect, Terminal, TerminalMouseEvent,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn plain_ascii_text_is_written_to_grid() {
@@ -2956,6 +2999,7 @@ mod tests {
         let mut term = Terminal::new(10, 4);
         let original = image_placement(GridPoint { col: 0, row: 0 }, 2);
         term.add_image_placement(original);
+        assert_eq!(term.take_damage(), Damage::Full);
         let replacement = ImagePlacement {
             anchor: GridPoint { col: 4, row: 1 },
             ..original
@@ -2964,6 +3008,7 @@ mod tests {
         term.upsert_image_placement(replacement);
 
         assert_eq!(term.snapshot().image_placements, vec![replacement]);
+        assert_eq!(term.take_damage(), Damage::Full);
         term.remove_image_placement(replacement.placement_id);
         assert!(term.snapshot().image_placements.is_empty());
     }
@@ -2984,6 +3029,31 @@ mod tests {
         term.remove_image_placements(first.image_id);
 
         assert_eq!(term.snapshot().image_placements, vec![second]);
+    }
+
+    #[test]
+    fn batch_image_placement_removal_uses_logical_state_and_marks_full_damage_once() {
+        let mut term = Terminal::new(10, 4);
+        let first = image_placement(GridPoint { col: 0, row: 0 }, 1);
+        let second = ImagePlacement {
+            placement_id: ImagePlacementId::new(2),
+            image_id: ImageId::new(2),
+            anchor: GridPoint { col: 1, row: -1 },
+            ..first
+        };
+        term.add_image_placement(first);
+        term.add_image_placement(second);
+        assert_eq!(term.take_damage(), Damage::Full);
+        assert_eq!(term.logical_image_placements(), &[first, second]);
+
+        term.remove_image_placements_by_ids(&BTreeSet::from([
+            first.placement_id,
+            second.placement_id,
+        ]));
+
+        assert!(term.logical_image_placements().is_empty());
+        assert_eq!(term.take_damage(), Damage::Full);
+        assert_eq!(term.take_damage(), Damage::None);
     }
 
     #[test]
@@ -3103,11 +3173,20 @@ mod tests {
         ImagePlacement {
             placement_id: ImagePlacementId::new(1),
             image_id: ImageId::new(1),
+            kitty_image_id: None,
             anchor,
             columns: 2,
             rows,
             source_width: 2,
             source_height: u32::from(rows),
+            source_rect: ImageSourceRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: u32::from(rows),
+            },
+            pixel_offset: ImagePixelOffset::default(),
+            z_index: ImageZIndex::default(),
         }
     }
 

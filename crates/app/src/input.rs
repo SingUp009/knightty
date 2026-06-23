@@ -7,15 +7,16 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use knightty_core::{
-    Damage, GridSnapshot, Hyperlink, ImageId, ImagePlacementId, MouseButton as TerminalMouseButton,
-    MouseEventKind, MouseProtocol, SelectionMode, SelectionPoint, Terminal, TerminalMouseEvent,
+    Damage, GridSnapshot, Hyperlink, ImageId, ImagePlacement, ImagePlacementId,
+    MouseButton as TerminalMouseButton, MouseEventKind, MouseProtocol, SelectionMode,
+    SelectionPoint, Terminal, TerminalMouseEvent,
 };
 use knightty_proto::iterm2::parse_iterm2_inline_image;
 use knightty_proto::kitty::{
     GraphicsEscapeRouter, GraphicsStreamItem, KittyAction, KittyCommand, KittyContinuation,
-    KittyErrorCode, KittyImageKey, KittyPlacementKey, KittyProtocolError, KittyResponseContext,
-    MAX_KITTY_CHUNK_BYTES, ParsedKittyCommand, encode_response, parse_kitty_command,
-    response_context,
+    KittyDeleteSelector, KittyErrorCode, KittyFormat, KittyImageKey, KittyPlacementKey,
+    KittyProtocolError, KittyResponseContext, MAX_KITTY_CHUNK_BYTES, ParsedKittyCommand,
+    encode_response, parse_kitty_command, response_context,
 };
 use knightty_render::{CellMetrics, ImePreedit, InlineImageData, SearchMatch};
 use thiserror::Error;
@@ -27,8 +28,9 @@ use winit::window::{Cursor, CursorIcon, Window};
 use crate::config::AppConfig;
 use crate::graphics_diagnostics;
 use crate::inline_image::{
-    DecodedImage, ImageLimits, InlineImageError, PtyStreamItem, decode_png, decode_png_payload,
-    pending_inline_image_is_oversized, placement_for_image, placement_for_kitty, scan_pty_stream,
+    DecodedImage, ImageLimits, InlineImageError, KittyPlacementOptions, PtyStreamItem,
+    decode_kitty_image, decode_png, pending_inline_image_is_oversized, placement_for_image,
+    placement_for_kitty, scan_pty_stream,
 };
 
 pub trait ClipboardPort {
@@ -116,10 +118,10 @@ impl CursorPort for RuntimeInputPorts {
 #[derive(Clone, Copy, Debug)]
 struct KittyTransmitMetadata {
     display: bool,
+    format: KittyFormat,
     image_id: Option<KittyImageKey>,
     placement_id: Option<u32>,
-    columns: Option<u16>,
-    rows: Option<u16>,
+    placement: KittyPlacementOptions,
     cursor_movement: bool,
 }
 
@@ -127,12 +129,27 @@ impl KittyTransmitMetadata {
     fn from_command(command: &KittyCommand<'_>, display: bool) -> Self {
         Self {
             display,
+            format: command.format,
             image_id: command.image_id,
             placement_id: command.placement_id,
-            columns: command.columns,
-            rows: command.rows,
+            placement: kitty_placement_options(command),
             cursor_movement: command.cursor_movement,
         }
+    }
+}
+
+fn kitty_placement_options(command: &KittyCommand<'_>) -> KittyPlacementOptions {
+    KittyPlacementOptions {
+        columns: command.columns,
+        rows: command.rows,
+        source_x: command.source_x,
+        source_y: command.source_y,
+        source_width: command.source_width,
+        source_height: command.source_height,
+        pixel_offset_x: command.pixel_offset_x,
+        pixel_offset_y: command.pixel_offset_y,
+        z_index: command.z_index,
+        kitty_image_id: command.image_id.map(|key| key.client_id),
     }
 }
 
@@ -141,6 +158,12 @@ struct PartialKittyUpload {
     metadata: KittyTransmitMetadata,
     response_context: KittyResponseContext,
     encoded: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct DeletePlan {
+    placement_ids: BTreeSet<ImagePlacementId>,
+    hard_image_ids: BTreeSet<ImageId>,
 }
 
 pub struct InputRouter<P> {
@@ -153,6 +176,7 @@ pub struct InputRouter<P> {
     inline_image_bytes: usize,
     kitty_image_ids: BTreeMap<KittyImageKey, ImageId>,
     kitty_placement_ids: BTreeMap<KittyPlacementKey, ImagePlacementId>,
+    kitty_placements: BTreeSet<ImagePlacementId>,
     partial_kitty_upload: Option<PartialKittyUpload>,
     next_image_id: u64,
     next_placement_id: u64,
@@ -193,6 +217,7 @@ impl<P: InputPorts> InputRouter<P> {
             inline_image_bytes: 0,
             kitty_image_ids: BTreeMap::new(),
             kitty_placement_ids: BTreeMap::new(),
+            kitty_placements: BTreeSet::new(),
             partial_kitty_upload: None,
             next_image_id: 1,
             next_placement_id: 1,
@@ -241,6 +266,7 @@ impl<P: InputPorts> InputRouter<P> {
             self.inline_image_bytes = 0;
             self.kitty_image_ids.clear();
             self.kitty_placement_ids.clear();
+            self.kitty_placements.clear();
         }
         self.config = config;
     }
@@ -395,6 +421,7 @@ impl<P: InputPorts> InputRouter<P> {
             self.partial_kitty_upload = None;
             self.kitty_image_ids.clear();
             self.kitty_placement_ids.clear();
+            self.kitty_placements.clear();
         }
         for response in self.terminal.take_pty_writes() {
             self.write_pty(response.as_bytes());
@@ -607,7 +634,8 @@ impl<P: InputPorts> InputRouter<P> {
     ) -> Result<(), KittyProtocolError> {
         self.evict_unreferenced_inline_images();
         let limits = ImageLimits::from(&self.config.graphics);
-        let image = decode_png_payload(payload, limits).map_err(kitty_image_error)?;
+        let image = decode_kitty_image(metadata.format, payload, limits)
+            .map_err(|error| kitty_image_error(metadata.format, error))?;
         graphics_diagnostics::record_decode_success(payload.len(), image.width, image.height);
         let existing_id = metadata
             .image_id
@@ -653,12 +681,11 @@ impl<P: InputPorts> InputRouter<P> {
                     internal_id,
                     placement_id,
                     &image,
-                    metadata.columns,
-                    metadata.rows,
+                    metadata.placement,
                     self.terminal.image_anchor(),
                     self.cell_metrics,
                 )
-                .map_err(kitty_image_error)?,
+                .map_err(|error| kitty_image_error(metadata.format, error))?,
             )
         } else {
             None
@@ -678,6 +705,7 @@ impl<P: InputPorts> InputRouter<P> {
 
         if let Some(placement) = placement {
             self.terminal.upsert_image_placement(placement);
+            self.kitty_placements.insert(placement.placement_id);
             graphics_diagnostics::record_placement_created();
             if let (Some(image_key), Some(client_placement_id)) =
                 (metadata.image_id, metadata.placement_id)
@@ -721,14 +749,14 @@ impl<P: InputPorts> InputRouter<P> {
             internal_id,
             placement_id,
             &image,
-            command.columns,
-            command.rows,
+            kitty_placement_options(command),
             self.terminal.image_anchor(),
             self.cell_metrics,
         )
-        .map_err(kitty_image_error)?;
+        .map_err(|error| kitty_image_error(KittyFormat::Png, error))?;
 
         self.terminal.upsert_image_placement(placement);
+        self.kitty_placements.insert(placement.placement_id);
         graphics_diagnostics::record_placement_created();
         if let Some(placement_key) = placement_key {
             self.kitty_placement_ids.insert(placement_key, placement_id);
@@ -741,24 +769,145 @@ impl<P: InputPorts> InputRouter<P> {
     }
 
     fn handle_kitty_delete(&mut self, command: &KittyCommand<'_>) {
-        let image_key = command.image_id.expect("parser requires an image id");
-        let Some(internal_id) = self.kitty_image_ids.get(&image_key).copied() else {
-            return;
-        };
+        let selector = command
+            .delete_selector
+            .expect("parser provides a typed delete selector");
+        let plan = self.build_kitty_delete_plan(selector);
+        self.apply_kitty_delete_plan(plan);
+    }
 
-        if let Some(placement_id) = command.placement_id {
-            let key = KittyPlacementKey {
-                client_image_id: image_key.client_id,
-                placement_id,
-            };
-            if let Some(internal_placement_id) = self.kitty_placement_ids.remove(&key) {
-                self.terminal.remove_image_placement(internal_placement_id);
+    fn build_kitty_delete_plan(&self, selector: KittyDeleteSelector) -> DeletePlan {
+        let placements = self
+            .terminal
+            .logical_image_placements()
+            .iter()
+            .filter(|placement| self.kitty_placements.contains(&placement.placement_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let placements = placements.as_slice();
+        let (screen_columns, screen_rows) = self.terminal.size();
+        let mut plan = DeletePlan::default();
+
+        match selector {
+            KittyDeleteSelector::All { hard } => {
+                add_matching_placements(&mut plan, placements, hard, |placement| {
+                    placement_intersects_live_screen(placement, screen_columns, screen_rows)
+                })
             }
-        } else {
-            self.terminal.remove_image_placements(internal_id);
-            self.kitty_placement_ids
-                .retain(|placement, _| placement.client_image_id != image_key.client_id);
+            KittyDeleteSelector::Image {
+                hard,
+                image_id,
+                placement_id,
+            } => {
+                let Some(internal_image_id) = self.kitty_image_ids.get(&image_id).copied() else {
+                    return plan;
+                };
+                if let Some(placement_id) = placement_id {
+                    let placement_key = KittyPlacementKey {
+                        client_image_id: image_id.client_id,
+                        placement_id,
+                    };
+                    let Some(internal_placement_id) =
+                        self.kitty_placement_ids.get(&placement_key).copied()
+                    else {
+                        return plan;
+                    };
+                    if placements.iter().any(|placement| {
+                        placement.placement_id == internal_placement_id
+                            && placement.image_id == internal_image_id
+                    }) {
+                        plan.placement_ids.insert(internal_placement_id);
+                        if hard {
+                            plan.hard_image_ids.insert(internal_image_id);
+                        }
+                    }
+                } else {
+                    add_matching_placements(&mut plan, placements, hard, |placement| {
+                        placement.image_id == internal_image_id
+                    });
+                    if hard {
+                        // Uppercase I explicitly selects the image resource even
+                        // when it has no placements (for example after a soft delete).
+                        plan.hard_image_ids.insert(internal_image_id);
+                    }
+                }
+            }
+            KittyDeleteSelector::Cell { hard, column, row } => {
+                if let (Some(column), Some(row)) = (
+                    live_screen_coordinate(column, screen_columns),
+                    live_screen_coordinate(row, screen_rows),
+                ) {
+                    let row = isize::try_from(row).unwrap_or(isize::MAX);
+                    add_matching_placements(&mut plan, placements, hard, |placement| {
+                        placement_intersects_column(placement, column)
+                            && placement_intersects_row(placement, row)
+                    });
+                }
+            }
+            KittyDeleteSelector::Column { hard, column } => {
+                if let Some(column) = live_screen_coordinate(column, screen_columns) {
+                    add_matching_placements(&mut plan, placements, hard, |placement| {
+                        placement_intersects_column(placement, column)
+                    });
+                }
+            }
+            KittyDeleteSelector::Row { hard, row } => {
+                if let Some(row) = live_screen_coordinate(row, screen_rows) {
+                    let row = isize::try_from(row).unwrap_or(isize::MAX);
+                    add_matching_placements(&mut plan, placements, hard, |placement| {
+                        placement_intersects_row(placement, row)
+                    });
+                }
+            }
+            KittyDeleteSelector::ZIndex { hard, z_index } => {
+                add_matching_placements(&mut plan, placements, hard, |placement| {
+                    placement.z_index.0 == z_index
+                })
+            }
         }
+
+        plan
+    }
+
+    fn apply_kitty_delete_plan(&mut self, plan: DeletePlan) {
+        self.terminal
+            .remove_image_placements_by_ids(&plan.placement_ids);
+        self.kitty_placements
+            .retain(|placement_id| !plan.placement_ids.contains(placement_id));
+        self.kitty_placement_ids
+            .retain(|_, placement_id| !plan.placement_ids.contains(placement_id));
+
+        if plan.hard_image_ids.is_empty() {
+            return;
+        }
+        let referenced_images = self.terminal.image_placement_ids().collect::<BTreeSet<_>>();
+        let removable_images = plan
+            .hard_image_ids
+            .difference(&referenced_images)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if removable_images.is_empty() {
+            return;
+        }
+
+        let removed_client_ids = self
+            .kitty_image_ids
+            .iter()
+            .filter_map(|(key, image_id)| {
+                removable_images.contains(image_id).then_some(key.client_id)
+            })
+            .collect::<BTreeSet<_>>();
+        self.kitty_image_ids
+            .retain(|_, image_id| !removable_images.contains(image_id));
+        self.kitty_placement_ids
+            .retain(|key, _| !removed_client_ids.contains(&key.client_image_id));
+        self.inline_images
+            .retain(|image_id, _| !removable_images.contains(image_id));
+        self.inline_image_bytes = self
+            .inline_images
+            .values()
+            .map(|image| image.rgba.len())
+            .sum();
     }
 
     fn write_kitty_response(
@@ -788,6 +937,8 @@ impl<P: InputPorts> InputRouter<P> {
         live.extend(self.kitty_image_ids.values().copied());
         self.inline_images.retain(|id, _| live.contains(id));
         let live_placements = self.terminal.placement_ids().collect::<BTreeSet<_>>();
+        self.kitty_placements
+            .retain(|placement_id| live_placements.contains(placement_id));
         self.kitty_placement_ids
             .retain(|_, placement_id| live_placements.contains(placement_id));
         self.inline_image_bytes = self
@@ -1261,6 +1412,59 @@ impl<P: InputPorts> InputRouter<P> {
     }
 }
 
+fn add_matching_placements(
+    plan: &mut DeletePlan,
+    placements: &[ImagePlacement],
+    hard: bool,
+    mut matches: impl FnMut(&ImagePlacement) -> bool,
+) {
+    for placement in placements.iter().filter(|placement| matches(placement)) {
+        plan.placement_ids.insert(placement.placement_id);
+        if hard {
+            plan.hard_image_ids.insert(placement.image_id);
+        }
+    }
+}
+
+fn live_screen_coordinate(protocol_coordinate: u32, screen_extent: usize) -> Option<usize> {
+    let coordinate = protocol_coordinate.checked_sub(1)?;
+    let coordinate = usize::try_from(coordinate).ok()?;
+    (coordinate < screen_extent).then_some(coordinate)
+}
+
+fn placement_intersects_live_screen(
+    placement: &ImagePlacement,
+    screen_columns: usize,
+    screen_rows: usize,
+) -> bool {
+    let screen_rows = isize::try_from(screen_rows).unwrap_or(isize::MAX);
+    placement.anchor.col < screen_columns
+        && placement.anchor.row < screen_rows
+        && placement
+            .anchor
+            .row
+            .saturating_add(isize::try_from(placement.rows).unwrap_or(isize::MAX))
+            > 0
+}
+
+fn placement_intersects_column(placement: &ImagePlacement, column: usize) -> bool {
+    placement.anchor.col <= column
+        && column
+            < placement
+                .anchor
+                .col
+                .saturating_add(usize::from(placement.columns))
+}
+
+fn placement_intersects_row(placement: &ImagePlacement, row: isize) -> bool {
+    placement.anchor.row <= row
+        && row
+            < placement
+                .anchor
+                .row
+                .saturating_add(isize::try_from(placement.rows).unwrap_or(isize::MAX))
+}
+
 fn kitty_image_not_found() -> KittyProtocolError {
     KittyProtocolError::new(KittyErrorCode::NoEntry, "image id was not found")
 }
@@ -1281,11 +1485,23 @@ fn validate_kitty_chunk(payload: &[u8], more_chunks: bool) -> Result<(), KittyPr
     Ok(())
 }
 
-fn kitty_image_error(error: InlineImageError) -> KittyProtocolError {
+fn kitty_image_error(format: KittyFormat, error: InlineImageError) -> KittyProtocolError {
     match error {
+        InlineImageError::InvalidBase64 if format == KittyFormat::Png => {
+            KittyProtocolError::new(KittyErrorCode::BadPng, "invalid base64 in PNG payload")
+        }
+        InlineImageError::InvalidPng if format == KittyFormat::Png => {
+            KittyProtocolError::new(KittyErrorCode::BadPng, "invalid PNG image data")
+        }
+        InlineImageError::ZeroDimension if format == KittyFormat::Png => {
+            KittyProtocolError::new(KittyErrorCode::BadPng, "PNG has zero dimension")
+        }
         InlineImageError::InvalidBase64
-        | InlineImageError::InvalidPng
+        | InlineImageError::InvalidPayloadLength
         | InlineImageError::ZeroDimension => {
+            KittyProtocolError::new(KittyErrorCode::Invalid, "invalid raw image data")
+        }
+        InlineImageError::InvalidPng => {
             KittyProtocolError::new(KittyErrorCode::BadPng, "invalid PNG image data")
         }
         InlineImageError::EncodedTooLarge
@@ -1299,6 +1515,14 @@ fn kitty_image_error(error: InlineImageError) -> KittyProtocolError {
         InlineImageError::ZeroCellSize => {
             KittyProtocolError::new(KittyErrorCode::Invalid, "terminal cell size is zero")
         }
+        InlineImageError::InvalidSourceRectangle => KittyProtocolError::new(
+            KittyErrorCode::Invalid,
+            "image source rectangle does not intersect the image",
+        ),
+        InlineImageError::InvalidPixelOffset => KittyProtocolError::new(
+            KittyErrorCode::Invalid,
+            "image pixel offset is outside the anchor cell",
+        ),
     }
 }
 
@@ -1771,7 +1995,11 @@ mod harness_tests {
         UrlOpenPort, allowed_hyperlink_url,
     };
     use crate::config::AppConfig;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use knightty_render::{ImePreedit, SearchMatch};
+    use std::io::Cursor;
     use std::ops::Range;
     use winit::event::{ElementState, MouseButton};
     use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -1996,6 +2224,21 @@ mod harness_tests {
         kitty_sequence(&format!("m={more_chunks}{quiet}"), Some(payload))
     }
 
+    fn rgba_png_payload(width: u32, height: u32) -> String {
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            width,
+            height,
+            Rgba([255, 0, 0, 128]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, ImageFormat::Png).unwrap();
+        STANDARD.encode(encoded.into_inner())
+    }
+
+    fn raw_payload(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
     #[test]
     fn inline_png_is_decoded_placed_and_kept_out_of_terminal_text() {
         let mut app = AppHarness::new();
@@ -2074,6 +2317,157 @@ mod harness_tests {
         assert_eq!(snapshot.image_placements[0].anchor.col, 1);
         assert_eq!(snapshot.image_placements[0].columns, 2);
         assert_eq!(app.pty_writes(), &[b"\x1b_Gi=42,p=7;OK\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn kitty_raw_rgb_and_rgba_reach_the_shared_rgba_render_input() {
+        let mut rgb_app = AppHarness::new();
+        let rgb = raw_payload(&[255, 0, 0, 0, 255, 0]);
+        rgb_app.feed(&kitty_sequence(
+            "a=T,f=24,s=2,v=1,i=50,p=7,c=2,r=1,x=1,y=0,w=1,h=1,X=1,Y=1,z=5,C=1",
+            Some(&rgb),
+        ));
+
+        let snapshot = rgb_app.router.snapshot();
+        assert_eq!(snapshot.image_placements.len(), 1);
+        let placement = snapshot.image_placements[0];
+        assert_eq!((placement.source_width, placement.source_height), (2, 1));
+        assert_eq!(
+            (
+                placement.source_rect.x,
+                placement.source_rect.y,
+                placement.source_rect.width,
+                placement.source_rect.height,
+            ),
+            (1, 0, 1, 1)
+        );
+        assert_eq!((placement.pixel_offset.x, placement.pixel_offset.y), (1, 1));
+        assert_eq!(placement.z_index.0, 5);
+        let images = rgb_app.router.inline_images_for_snapshot(&snapshot);
+        assert_eq!(&*images[0].rgba, &[255, 0, 0, 255, 0, 255, 0, 255]);
+
+        rgb_app.feed(&kitty_sequence(
+            "a=p,i=50,p=7,x=0,y=0,w=1,h=1,C=1,q=1",
+            None,
+        ));
+        let replacement = rgb_app.router.snapshot().image_placements[0];
+        assert_eq!(replacement.image_id, placement.image_id);
+        assert_eq!(replacement.placement_id, placement.placement_id);
+        assert_eq!(replacement.source_rect.x, 0);
+
+        let mut rgba_app = AppHarness::new();
+        let rgba_bytes = [10, 20, 30, 0, 40, 50, 60, 128, 70, 80, 90, 255];
+        let rgba = raw_payload(&rgba_bytes);
+        rgba_app.feed(&kitty_sequence("a=T,f=32,s=3,v=1,i=51,C=1", Some(&rgba)));
+        let snapshot = rgba_app.router.snapshot();
+        let images = rgba_app.router.inline_images_for_snapshot(&snapshot);
+        assert_eq!(&*images[0].rgba, &rgba_bytes);
+    }
+
+    #[test]
+    fn kitty_raw_multipart_decodes_only_after_the_final_chunk() {
+        for (format, bytes, expected_rgba) in [
+            (
+                "f=24,s=2,v=1",
+                vec![1, 2, 3, 4, 5, 6],
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+            ),
+            (
+                "f=32,s=2,v=1",
+                vec![1, 2, 3, 4, 5, 6, 7, 128],
+                vec![1, 2, 3, 4, 5, 6, 7, 128],
+            ),
+        ] {
+            let mut app = AppHarness::new();
+            let payload = raw_payload(&bytes);
+            let chunks = payload.as_bytes().chunks(4).collect::<Vec<_>>();
+            app.feed(&kitty_sequence(
+                &format!("a=T,{format},i=42,C=1,m=1"),
+                Some(std::str::from_utf8(chunks[0]).unwrap()),
+            ));
+            for chunk in &chunks[1..chunks.len() - 1] {
+                app.feed(&kitty_continuation(
+                    true,
+                    None,
+                    std::str::from_utf8(chunk).unwrap(),
+                ));
+            }
+
+            assert!(app.router.snapshot().image_placements.is_empty());
+            assert!(app.router.inline_images.is_empty());
+
+            app.feed(&kitty_continuation(
+                false,
+                None,
+                std::str::from_utf8(chunks.last().unwrap()).unwrap(),
+            ));
+
+            let snapshot = app.router.snapshot();
+            let images = app.router.inline_images_for_snapshot(&snapshot);
+            assert_eq!(&*images[0].rgba, expected_rgba);
+        }
+    }
+
+    #[test]
+    fn kitty_raw_failed_retransmit_is_atomic_and_success_replaces_the_image() {
+        let mut app = AppHarness::new();
+        let red = raw_payload(&[255, 0, 0, 255]);
+        app.feed(&kitty_sequence(
+            "a=T,f=32,s=1,v=1,i=42,p=7,C=1,q=1",
+            Some(&red),
+        ));
+        let previous = app.router.snapshot().image_placements[0];
+
+        let short = raw_payload(&[0, 255, 0]);
+        app.feed(&kitty_sequence(
+            "a=T,f=32,s=1,v=1,i=42,p=8,C=1",
+            Some(&short),
+        ));
+        let snapshot = app.router.snapshot();
+        assert_eq!(snapshot.image_placements, vec![previous]);
+        assert_eq!(
+            &*app.router.inline_images_for_snapshot(&snapshot)[0].rgba,
+            &[255, 0, 0, 255]
+        );
+        assert!(
+            app.pty_writes()
+                .last()
+                .unwrap()
+                .starts_with(b"\x1b_Gi=42,p=8;EINVAL:")
+        );
+
+        let green = raw_payload(&[0, 255, 0, 128]);
+        app.feed(&kitty_sequence(
+            "a=T,f=32,s=1,v=1,i=42,p=9,C=1,q=1",
+            Some(&green),
+        ));
+        let snapshot = app.router.snapshot();
+        assert_eq!(snapshot.image_placements.len(), 1);
+        assert_ne!(snapshot.image_placements[0].image_id, previous.image_id);
+        assert_eq!(
+            &*app.router.inline_images_for_snapshot(&snapshot)[0].rgba,
+            &[0, 255, 0, 128]
+        );
+    }
+
+    #[test]
+    fn kitty_raw_malformed_data_is_einval_and_limit_failures_are_e2big() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=24,s=1,v=1,i=42", Some("***")));
+        assert_eq!(
+            app.pty_writes(),
+            &[b"\x1b_Gi=42;EINVAL:invalid raw image data\x1b\\".to_vec()]
+        );
+
+        let mut config = AppConfig::default();
+        config.graphics.max_decoded_bytes = 3;
+        let mut router = InputRouter::new(config, FakePorts::default());
+        let rgba = raw_payload(&[1, 2, 3, 4]);
+        router.feed_pty_bytes(&kitty_sequence("a=t,f=32,s=1,v=1,i=43", Some(&rgba)));
+        assert_eq!(
+            router.ports().pty_writes,
+            vec![b"\x1b_Gi=43;E2BIG:image exceeds configured limits\x1b\\".to_vec()]
+        );
     }
 
     #[test]
@@ -2350,6 +2744,72 @@ mod harness_tests {
     }
 
     #[test]
+    fn kitty_named_replacement_updates_crop_offset_and_z_without_replacing_texture() {
+        let mut app = AppHarness::new();
+        let payload = rgba_png_payload(2, 2);
+        app.feed(&kitty_sequence("a=t,f=100,i=42,q=1", Some(&payload)));
+        app.feed(&kitty_sequence(
+            "a=p,i=42,p=7,x=0,y=0,w=1,h=2,X=0,Y=0,z=-2,C=1,q=1",
+            None,
+        ));
+        let original = app.router.snapshot().image_placements[0];
+
+        app.feed(&kitty_sequence(
+            "a=p,i=42,p=7,x=1,y=0,w=1,h=1,X=1,Y=1,z=5,C=1,q=1",
+            None,
+        ));
+
+        let snapshot = app.router.snapshot();
+        assert_eq!(snapshot.image_placements.len(), 1);
+        let replacement = snapshot.image_placements[0];
+        assert_eq!(replacement.placement_id, original.placement_id);
+        assert_eq!(replacement.image_id, original.image_id);
+        assert_eq!(replacement.source_rect.x, 1);
+        assert_eq!(
+            (
+                replacement.source_rect.width,
+                replacement.source_rect.height
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (replacement.pixel_offset.x, replacement.pixel_offset.y),
+            (1, 1)
+        );
+        assert_eq!(replacement.z_index.0, 5);
+        assert_eq!(replacement.kitty_image_id, Some(42));
+    }
+
+    #[test]
+    fn kitty_empty_crop_and_out_of_cell_offset_return_einval() {
+        let mut app = AppHarness::new();
+        let payload = rgba_png_payload(2, 2);
+        app.feed(&kitty_sequence("a=t,f=100,i=42,q=1", Some(&payload)));
+
+        app.feed(&kitty_sequence("a=p,i=42,p=7,x=2,q=0", None));
+        assert!(app.router.snapshot().image_placements.is_empty());
+        assert!(
+            app.pty_writes()
+                .last()
+                .unwrap()
+                .starts_with(b"\x1b_Gi=42,p=7;EINVAL:")
+        );
+
+        let invalid_x = app.router.cell_metrics.width;
+        app.feed(&kitty_sequence(
+            &format!("a=p,i=42,p=7,X={invalid_x},q=0"),
+            None,
+        ));
+        assert!(app.router.snapshot().image_placements.is_empty());
+        assert!(
+            app.pty_writes()
+                .last()
+                .unwrap()
+                .starts_with(b"\x1b_Gi=42,p=7;EINVAL:")
+        );
+    }
+
+    #[test]
     fn kitty_retransmit_replaces_image_and_all_existing_placements() {
         let mut app = AppHarness::new();
         app.feed(&kitty_sequence(
@@ -2460,6 +2920,244 @@ mod harness_tests {
 
         assert_eq!(app.router.snapshot().image_placements.len(), 1);
         assert!(app.pty_writes().is_empty());
+    }
+
+    #[test]
+    fn kitty_cell_delete_uses_one_based_live_screen_coordinates_at_first_and_last_cells() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=100,i=50,q=1", Some(TRANSPARENT_PNG)));
+        app.feed(b"\x1b[1;1H");
+        app.feed(&kitty_sequence("a=p,i=50,p=1,c=1,r=1,C=1,q=1", None));
+        app.feed(b"\x1b[5;40H");
+        app.feed(&kitty_sequence("a=p,i=50,p=2,c=1,r=1,C=1,q=1", None));
+
+        app.feed(&kitty_sequence("a=d,d=p,x=1,y=1", None));
+        let remaining = app.router.terminal.logical_image_placements();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!((remaining[0].anchor.col, remaining[0].anchor.row), (39, 4));
+
+        app.feed(&kitty_sequence("a=d,d=p,x=40,y=5", None));
+        assert!(app.router.terminal.logical_image_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_cell_delete_uses_live_rows_when_history_exists_and_scrollback_is_visible() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=100,i=51,q=1", Some(TRANSPARENT_PNG)));
+        app.feed(b"\x1b[1;1H");
+        app.feed(&kitty_sequence("a=p,i=51,p=1,c=1,r=1,C=1,q=1", None));
+        for _ in 0..8 {
+            app.feed(b"\r\n");
+        }
+        app.feed(b"\x1b[1;1H");
+        app.feed(&kitty_sequence("a=p,i=51,p=2,c=1,r=1,C=1,q=1", None));
+        assert!(
+            app.router
+                .terminal
+                .logical_image_placements()
+                .iter()
+                .any(|placement| placement.anchor.row < 0)
+        );
+        assert!(matches!(
+            app.router.terminal.scroll_to_top(),
+            knightty_core::Damage::Full
+        ));
+
+        app.feed(&kitty_sequence("a=d,d=p,x=1,y=1", None));
+
+        let remaining = app.router.terminal.logical_image_placements();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].anchor.row < 0);
+    }
+
+    #[test]
+    fn kitty_cell_delete_uses_active_alternate_screen_and_resized_bounds() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=100,i=52,q=1", Some(TRANSPARENT_PNG)));
+        app.feed(b"\x1b[?1049h");
+        assert!(app.router.terminal.alternate_screen_enabled());
+        app.router.resize(5, 3);
+        app.feed(b"\x1b[3;5H");
+        app.feed(&kitty_sequence("a=p,i=52,p=1,c=1,r=1,C=1,q=1", None));
+
+        app.feed(&kitty_sequence("a=d,d=p,x=6,y=4", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+        app.feed(&kitty_sequence("a=d,d=p,x=5,y=3", None));
+        assert!(app.router.terminal.logical_image_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_column_row_z_and_all_selectors_use_logical_placement_rectangles() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=100,i=60,q=1", Some(TRANSPARENT_PNG)));
+        app.feed(b"\x1b[2;2H");
+        app.feed(&kitty_sequence(
+            "a=p,i=60,p=1,c=3,r=2,x=0,y=0,w=1,h=1,X=1,Y=1,z=-1,C=1,q=1",
+            None,
+        ));
+        app.feed(b"\x1b[4;10H");
+        app.feed(&kitty_sequence("a=p,i=60,p=2,c=2,r=1,z=5,C=1,q=1", None));
+
+        app.feed(&kitty_sequence("a=d,d=x,x=3", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+        app.feed(b"\x1b[2;2H");
+        app.feed(&kitty_sequence(
+            "a=p,i=60,p=1,c=3,r=2,X=1,Y=1,z=-1,C=1,q=1",
+            None,
+        ));
+        app.feed(&kitty_sequence("a=d,d=y,y=3", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+        app.feed(b"\x1b[2;2H");
+        app.feed(&kitty_sequence("a=p,i=60,p=1,c=3,r=2,z=-1,C=1,q=1", None));
+        app.feed(&kitty_sequence("a=d,d=z,z=5", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+        app.feed(&kitty_sequence("a=d", None));
+        assert!(app.router.terminal.logical_image_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_delete_selectors_ignore_iterm2_placements_and_include_anonymous_kitty_placements() {
+        let mut app = AppHarness::new();
+        let iterm2 = format!("\x1b]1337;File=inline=1:{TRANSPARENT_PNG}\x07");
+        app.feed(iterm2.as_bytes());
+        app.feed(&kitty_sequence(
+            "a=T,f=100,i=70,p=1,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 2);
+
+        app.feed(&kitty_sequence("a=d", None));
+        let remaining = app.router.terminal.logical_image_placements();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kitty_image_id, None);
+
+        app.feed(&kitty_sequence("a=T,f=100,C=1,q=1", Some(TRANSPARENT_PNG)));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 2);
+        assert_eq!(app.router.kitty_placements.len(), 1);
+        app.feed(&kitty_sequence("a=d", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+        assert!(app.router.kitty_placements.is_empty());
+    }
+
+    #[test]
+    fn kitty_hard_image_delete_releases_transfer_only_and_soft_deleted_resources() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence("a=t,f=100,i=10,q=1", Some(TRANSPARENT_PNG)));
+        assert!(
+            app.router
+                .kitty_image_ids
+                .contains_key(&KittyImageKey { client_id: 10 })
+        );
+        app.feed(&kitty_sequence("a=d,d=I,i=10", None));
+        assert!(app.router.inline_images.is_empty());
+        assert!(app.router.kitty_image_ids.is_empty());
+        assert_eq!(app.router.inline_image_bytes, 0);
+
+        app.feed(&kitty_sequence(
+            "a=T,f=100,i=11,p=1,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        app.feed(&kitty_sequence("a=d,d=i,i=11", None));
+        assert!(app.router.terminal.logical_image_placements().is_empty());
+        assert_eq!(app.router.inline_images.len(), 1);
+        app.feed(&kitty_sequence("a=d,d=I,i=11", None));
+        assert!(app.router.inline_images.is_empty());
+        app.feed(&kitty_sequence("a=p,i=11,q=0", None));
+        assert!(
+            app.pty_writes()
+                .last()
+                .unwrap()
+                .starts_with(b"\x1b_Gi=11;ENOENT:")
+        );
+    }
+
+    #[test]
+    fn kitty_hard_delete_keeps_referenced_images_and_unrelated_soft_orphans() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence(
+            "a=T,f=100,i=10,p=1,z=1,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        app.feed(&kitty_sequence("a=d,d=i,i=10", None));
+        app.feed(&kitty_sequence(
+            "a=T,f=100,i=20,p=1,z=2,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        app.feed(b"\x1b[2;1H");
+        app.feed(&kitty_sequence("a=p,i=20,p=2,z=3,C=1,q=1", None));
+
+        app.feed(&kitty_sequence("a=d,d=Z,z=2", None));
+        assert!(
+            app.router
+                .kitty_image_ids
+                .contains_key(&KittyImageKey { client_id: 20 })
+        );
+        app.feed(&kitty_sequence("a=d,d=Z,z=3", None));
+        assert!(
+            !app.router
+                .kitty_image_ids
+                .contains_key(&KittyImageKey { client_id: 20 })
+        );
+        assert!(
+            app.router
+                .kitty_image_ids
+                .contains_key(&KittyImageKey { client_id: 10 })
+        );
+
+        app.feed(&kitty_sequence("a=p,i=10,p=2,C=1,q=1", None));
+        assert_eq!(app.router.terminal.logical_image_placements().len(), 1);
+    }
+
+    #[test]
+    fn kitty_hard_delete_frees_quota_but_soft_delete_does_not() {
+        let mut config = AppConfig::default();
+        config.graphics.max_images = 1;
+        let mut router = InputRouter::new(config, FakePorts::default());
+        router.feed_pty_bytes(&kitty_sequence(
+            "a=T,f=100,i=1,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        router.feed_pty_bytes(&kitty_sequence("a=d,d=i,i=1", None));
+        router.feed_pty_bytes(&kitty_sequence("a=t,f=100,i=2,q=0", Some(TRANSPARENT_PNG)));
+        assert!(
+            router
+                .ports()
+                .pty_writes
+                .last()
+                .unwrap()
+                .starts_with(b"\x1b_Gi=2;ENOSPC:")
+        );
+
+        router.feed_pty_bytes(&kitty_sequence("a=d,d=I,i=1", None));
+        router.ports_mut().pty_writes.clear();
+        router.feed_pty_bytes(&kitty_sequence("a=t,f=100,i=2,q=1", Some(TRANSPARENT_PNG)));
+        assert!(router.ports().pty_writes.is_empty());
+        assert!(
+            router
+                .kitty_image_ids
+                .contains_key(&KittyImageKey { client_id: 2 })
+        );
+    }
+
+    #[test]
+    fn invalid_delete_aborts_partial_upload_without_mutating_image_state_or_quota() {
+        let mut app = AppHarness::new();
+        app.feed(&kitty_sequence(
+            "a=T,f=100,i=42,p=1,C=1,q=1",
+            Some(TRANSPARENT_PNG),
+        ));
+        let placements = app.router.terminal.logical_image_placements().to_vec();
+        let image_ids = app.router.kitty_image_ids.clone();
+        let image_bytes = app.router.inline_image_bytes;
+        app.feed(&kitty_sequence("a=t,f=100,i=99,q=1,m=1", Some("AAAA")));
+        assert!(app.router.partial_kitty_upload.is_some());
+
+        app.feed(&kitty_sequence("a=d,d=p,x=1", None));
+
+        assert!(app.router.partial_kitty_upload.is_none());
+        assert_eq!(app.router.terminal.logical_image_placements(), placements);
+        assert_eq!(app.router.kitty_image_ids, image_ids);
+        assert_eq!(app.router.inline_image_bytes, image_bytes);
     }
 
     #[test]

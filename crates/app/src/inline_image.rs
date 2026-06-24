@@ -19,6 +19,7 @@ const ST: u8 = 0x9c;
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const IT2_PREFIX: &[u8] = b"1337;File=";
+const CELL_SPAN_PREFIX: &[u8] = knightty_proto::cell_span::OSC_PREFIX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageLimits {
@@ -71,6 +72,8 @@ pub enum PtyStreamItem<'a> {
     Text(&'a [u8]),
     InlineImage(&'a str),
     InvalidInlineImage,
+    CellSpan(&'a str),
+    InvalidCellSpan,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -79,7 +82,7 @@ pub struct PtyStreamScan<'a> {
     pub consumed: usize,
 }
 
-/// Split complete iTerm2 image OSC sequences from ordinary PTY bytes.
+/// Split complete Knightty and iTerm2 OSC sequences from ordinary PTY bytes.
 pub fn scan_pty_stream(input: &[u8]) -> PtyStreamScan<'_> {
     let mut items = Vec::new();
     let mut cursor = 0;
@@ -100,6 +103,11 @@ pub fn scan_pty_stream(input: &[u8]) -> PtyStreamScan<'_> {
             match std::str::from_utf8(image) {
                 Ok(image) => items.push(PtyStreamItem::InlineImage(image)),
                 Err(_) => items.push(PtyStreamItem::InvalidInlineImage),
+            }
+        } else if let Some(cell_span) = payload.strip_prefix(CELL_SPAN_PREFIX) {
+            match std::str::from_utf8(cell_span) {
+                Ok(cell_span) => items.push(PtyStreamItem::CellSpan(cell_span)),
+                Err(_) => items.push(PtyStreamItem::InvalidCellSpan),
             }
         } else {
             items.push(PtyStreamItem::Text(&input[osc_start..sequence_end]));
@@ -629,6 +637,33 @@ mod tests {
             ]
         );
         assert_eq!(scan.consumed, input.len());
+    }
+
+    #[test]
+    fn bel_and_st_cell_spans_are_scanned_without_exposing_osc_bytes_as_text() {
+        let input = "before\u{1b}]7777;knightty;span=3x2:界\u{7}middle\u{1b}]7777;knightty;span=4x3:👨‍💻\u{1b}\\after";
+        let scan = scan_pty_stream(input.as_bytes());
+
+        assert_eq!(
+            scan.items,
+            vec![
+                PtyStreamItem::Text(b"before"),
+                PtyStreamItem::CellSpan("span=3x2:界"),
+                PtyStreamItem::Text(b"middle"),
+                PtyStreamItem::CellSpan("span=4x3:👨‍💻"),
+                PtyStreamItem::Text(b"after"),
+            ]
+        );
+        assert_eq!(scan.consumed, input.len());
+    }
+
+    #[test]
+    fn incomplete_cell_span_osc_is_retained_for_the_next_feed() {
+        let input = b"text\x1b]7777;knightty;span=2x2:A";
+        let scan = scan_pty_stream(input);
+
+        assert_eq!(scan.items, vec![PtyStreamItem::Text(b"text")]);
+        assert_eq!(scan.consumed, 4);
     }
 
     #[test]

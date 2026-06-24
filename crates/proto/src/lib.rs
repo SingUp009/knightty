@@ -1,5 +1,129 @@
 //! Protocol extension parsing.
 
+pub mod cell_span {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    pub const OSC_PREFIX: &[u8] = b"7777;knightty;";
+
+    /// One Knightty cell-span command parsed from an OSC 7777 payload.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CellSpanCommand<'a> {
+        pub columns: u16,
+        pub rows: u16,
+        pub text: &'a str,
+    }
+
+    /// Parse the payload following `7777;knightty;`.
+    ///
+    /// ```
+    /// use knightty_proto::cell_span::parse_cell_span;
+    ///
+    /// let command = parse_cell_span("span=3x2:界").unwrap();
+    /// assert_eq!((command.columns, command.rows, command.text), (3, 2, "界"));
+    /// ```
+    pub fn parse_cell_span(payload: &str) -> Result<CellSpanCommand<'_>, CellSpanParseError> {
+        let (dimensions, text) = payload
+            .strip_prefix("span=")
+            .and_then(|payload| payload.split_once(':'))
+            .ok_or(CellSpanParseError::MalformedCommand)?;
+        let (columns, rows) = dimensions
+            .split_once('x')
+            .ok_or(CellSpanParseError::MalformedDimensions)?;
+        let columns = parse_dimension(columns)?;
+        let rows = parse_dimension(rows)?;
+        if text.is_empty() {
+            return Err(CellSpanParseError::MissingText);
+        }
+        if text.chars().any(char::is_control) {
+            return Err(CellSpanParseError::ControlCharacter);
+        }
+
+        let mut graphemes = text.graphemes(true);
+        if graphemes.next().is_none() || graphemes.next().is_some() {
+            return Err(CellSpanParseError::MultipleGraphemes);
+        }
+
+        Ok(CellSpanCommand {
+            columns,
+            rows,
+            text,
+        })
+    }
+
+    fn parse_dimension(value: &str) -> Result<u16, CellSpanParseError> {
+        let value = value
+            .parse::<u16>()
+            .map_err(|_| CellSpanParseError::InvalidDimension)?;
+        if value == 0 {
+            return Err(CellSpanParseError::InvalidDimension);
+        }
+        Ok(value)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CellSpanParseError {
+        MalformedCommand,
+        MalformedDimensions,
+        InvalidDimension,
+        MissingText,
+        ControlCharacter,
+        MultipleGraphemes,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{CellSpanParseError, parse_cell_span};
+
+        #[test]
+        fn ascii_cell_span_parses() {
+            let command = parse_cell_span("span=4x2:A").unwrap();
+            assert_eq!((command.columns, command.rows, command.text), (4, 2, "A"));
+        }
+
+        #[test]
+        fn combining_sequence_is_one_grapheme() {
+            let command = parse_cell_span("span=2x2:e\u{301}").unwrap();
+            assert_eq!(command.text, "e\u{301}");
+        }
+
+        #[test]
+        fn zwj_emoji_is_one_grapheme() {
+            let command = parse_cell_span("span=4x3:👨‍💻").unwrap();
+            assert_eq!(command.text, "👨‍💻");
+        }
+
+        #[test]
+        fn multiple_graphemes_are_rejected() {
+            assert_eq!(
+                parse_cell_span("span=2x2:AB"),
+                Err(CellSpanParseError::MultipleGraphemes)
+            );
+        }
+
+        #[test]
+        fn zero_and_overflowing_dimensions_are_rejected() {
+            for payload in ["span=0x1:A", "span=1x0:A", "span=65536x1:A"] {
+                assert_eq!(
+                    parse_cell_span(payload),
+                    Err(CellSpanParseError::InvalidDimension)
+                );
+            }
+        }
+
+        #[test]
+        fn controls_and_empty_text_are_rejected() {
+            assert_eq!(
+                parse_cell_span("span=1x1:"),
+                Err(CellSpanParseError::MissingText)
+            );
+            assert_eq!(
+                parse_cell_span("span=1x1:\n"),
+                Err(CellSpanParseError::ControlCharacter)
+            );
+        }
+    }
+}
+
 pub mod iterm2 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;

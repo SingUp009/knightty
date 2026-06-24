@@ -13,7 +13,9 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
 use image::ImageError;
-use knightty_core::{Cell, Color, Cursor, Damage, GridSnapshot, ImageId, ImagePlacement};
+use knightty_core::{
+    Cell, CellSpanPlacement, Color, Cursor, Damage, GridSnapshot, ImageId, ImagePlacement,
+};
 use thiserror::Error;
 use unicode_width::UnicodeWidthChar;
 use wgpu::{
@@ -212,6 +214,7 @@ pub struct TextSegmentPlan {
     pub height: u32,
     pub text: String,
     pub style: TextStyle,
+    pub cell_span: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1127,13 +1130,8 @@ impl Renderer {
             buffer: &self.text_buffers[area.buffer_index],
             left: area.left,
             top: area.top,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: 0,
-                right: self.surface_config.width as i32,
-                bottom: self.surface_config.height as i32,
-            },
+            scale: area.scale,
+            bounds: area.bounds,
             default_color: DEFAULT_FG.to_glyphon(),
             custom_glyphs: &[],
         });
@@ -1266,6 +1264,10 @@ impl Renderer {
         for (index, segment) in plan.text.iter().enumerate() {
             let attrs = attrs_for_style(segment.style, self.font_family.as_deref());
             let buffer = &mut self.text_buffers[index];
+            buffer.set_monospace_width(
+                &mut self.font_system,
+                (!segment.cell_span).then_some(self.cell_metrics.width as f32),
+            );
             buffer.set_size(
                 &mut self.font_system,
                 Some(segment.width as f32),
@@ -1278,13 +1280,89 @@ impl Renderer {
                 Shaping::Advanced,
                 None,
             );
+            let (left, top, scale, bounds) = if segment.cell_span {
+                let glyph_advance = buffer.layout_runs().next().map_or(0.0, |run| run.line_w);
+                if let Some(scale) = cell_span_scale(
+                    glyph_advance,
+                    segment.width as f32,
+                    segment.height as f32,
+                    self.cell_metrics.line_height,
+                ) {
+                    let scaled_width = glyph_advance * scale;
+                    let scaled_height = self.cell_metrics.line_height * scale;
+                    (
+                        segment.x as f32 + (segment.width as f32 - scaled_width) * 0.5,
+                        segment.y as f32 + (segment.height as f32 - scaled_height) * 0.5,
+                        scale,
+                        TextBounds {
+                            left: segment.x.min(i32::MAX as u32) as i32,
+                            top: segment.y.min(i32::MAX as u32) as i32,
+                            right: segment.x.saturating_add(segment.width).min(i32::MAX as u32)
+                                as i32,
+                            bottom: segment
+                                .y
+                                .saturating_add(segment.height)
+                                .min(i32::MAX as u32) as i32,
+                        },
+                    )
+                } else {
+                    (
+                        segment.x as f32,
+                        segment.y as f32,
+                        1.0,
+                        TextBounds {
+                            left: segment.x.min(i32::MAX as u32) as i32,
+                            top: segment.y.min(i32::MAX as u32) as i32,
+                            right: segment
+                                .x
+                                .saturating_add(self.cell_metrics.width)
+                                .min(i32::MAX as u32) as i32,
+                            bottom: segment
+                                .y
+                                .saturating_add(self.cell_metrics.height)
+                                .min(i32::MAX as u32) as i32,
+                        },
+                    )
+                }
+            } else {
+                (
+                    segment.x as f32,
+                    segment.y as f32,
+                    1.0,
+                    TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: self.surface_config.width as i32,
+                        bottom: self.surface_config.height as i32,
+                    },
+                )
+            };
             self.prepared_text.push(PreparedTextArea {
                 buffer_index: index,
-                left: segment.x as f32,
-                top: segment.y as f32,
+                left,
+                top,
+                scale,
+                bounds,
             });
         }
     }
+}
+
+fn cell_span_scale(
+    glyph_advance: f32,
+    span_width: f32,
+    span_height: f32,
+    line_height: f32,
+) -> Option<f32> {
+    if !glyph_advance.is_finite()
+        || !line_height.is_finite()
+        || glyph_advance <= 0.0
+        || line_height <= 0.0
+    {
+        return None;
+    }
+    let scale = (span_width / glyph_advance).min(span_height / line_height);
+    scale.is_finite().then_some(scale.max(0.0))
 }
 
 pub fn available_font_families() -> Vec<FontFamilyInfo> {
@@ -1355,6 +1433,8 @@ struct PreparedTextArea {
     buffer_index: usize,
     left: f32,
     top: f32,
+    scale: f32,
+    bounds: TextBounds,
 }
 
 pub fn build_render_plan(
@@ -1411,10 +1491,13 @@ pub fn build_render_plan_with_appearance(
             row_index,
             context,
             &snapshot.selection_rects,
+            &snapshot.cell_spans,
             &mut text,
         );
         push_hyperlink_spans(row, row_index, &mut hyperlink_spans);
     }
+    push_cell_span_text(snapshot, context, &mut text);
+    push_cell_span_underline_rects(snapshot, layout, appearance, &mut rects);
     push_inline_image_quads(snapshot, layout, &mut images);
     push_search_rects(snapshot, layout, appearance, options, &mut rects);
     push_selection_rects(snapshot, layout, appearance, &mut selection_rects);
@@ -1669,10 +1752,16 @@ fn push_text_segments(
     row_index: usize,
     context: RenderPlanContext<'_>,
     selection_rects: &[knightty_core::SelectionRect],
+    cell_spans: &[CellSpanPlacement],
     text: &mut Vec<TextSegmentPlan>,
 ) {
     for (column, cell) in row.iter().enumerate() {
-        if cell.flags.wide_spacer || cell.ch == ' ' {
+        if cell.flags.wide_spacer
+            || cell.ch == ' '
+            || cell_spans
+                .iter()
+                .any(|span| span.anchor.row == row_index as isize && span.anchor.col == column)
+        {
             continue;
         }
 
@@ -1688,6 +1777,74 @@ fn push_text_segments(
             height: context.layout.metrics.height,
             text: cell.ch.to_string(),
             style: style_for_cell(cell, context.appearance, state),
+            cell_span: false,
+        });
+    }
+}
+
+fn push_cell_span_text(
+    snapshot: &GridSnapshot,
+    context: RenderPlanContext<'_>,
+    text: &mut Vec<TextSegmentPlan>,
+) {
+    for span in &snapshot.cell_spans {
+        let Ok(row) = usize::try_from(span.anchor.row) else {
+            continue;
+        };
+        if row >= snapshot.rows || span.anchor.col >= snapshot.cols {
+            continue;
+        }
+        text.push(TextSegmentPlan {
+            x: context.layout.cell_x(span.anchor.col),
+            y: context.layout.cell_y(row),
+            width: u32::from(span.columns).saturating_mul(context.layout.metrics.width),
+            height: u32::from(span.rows).saturating_mul(context.layout.metrics.height),
+            text: span.text.clone(),
+            style: style_for_cell(
+                &span.cell,
+                context.appearance,
+                visual_state_for_cell(
+                    &span.cell,
+                    span.anchor.col,
+                    row,
+                    &snapshot.selection_rects,
+                    context,
+                ),
+            ),
+            cell_span: true,
+        });
+    }
+}
+
+fn push_cell_span_underline_rects(
+    snapshot: &GridSnapshot,
+    layout: RenderLayout,
+    appearance: &RendererAppearance,
+    rects: &mut Vec<RectPlan>,
+) {
+    for span in &snapshot.cell_spans {
+        if !span.cell.flags.underline {
+            continue;
+        }
+        let Ok(row) = usize::try_from(span.anchor.row) else {
+            continue;
+        };
+        if row >= snapshot.rows || span.anchor.col >= snapshot.cols {
+            continue;
+        }
+        let bottom_row = row
+            .saturating_add(usize::from(span.rows))
+            .min(snapshot.rows)
+            .saturating_sub(1);
+        rects.push(RectPlan {
+            x: layout.cell_x(span.anchor.col),
+            y: layout
+                .cell_y(bottom_row)
+                .saturating_add(layout.metrics.height.saturating_sub(2)),
+            width: u32::from(span.columns).saturating_mul(layout.metrics.width),
+            height: 1,
+            color: effective_fg(&span.cell, &appearance.theme),
+            layer: RectLayer::Overlay,
         });
     }
 }
@@ -1939,7 +2096,7 @@ fn default_background_rect(cell: &Cell, theme: &ResolvedTheme) -> Option<Rgba> {
 }
 
 fn push_search_rects(
-    _snapshot: &GridSnapshot,
+    snapshot: &GridSnapshot,
     layout: RenderLayout,
     appearance: &RendererAppearance,
     options: &RenderOptions,
@@ -1949,10 +2106,17 @@ fn push_search_rects(
         if Some(search_match) == options.current_search_match.as_ref() {
             continue;
         }
-        push_search_rect(search_match, layout, appearance.search.background, rects);
+        push_search_rect(
+            snapshot,
+            search_match,
+            layout,
+            appearance.search.background,
+            rects,
+        );
     }
     if let Some(search_match) = &options.current_search_match {
         push_search_rect(
+            snapshot,
             search_match,
             layout,
             appearance.search.selected_background,
@@ -1962,6 +2126,7 @@ fn push_search_rects(
 }
 
 fn push_search_rect(
+    snapshot: &GridSnapshot,
     search_match: &SearchMatch,
     layout: RenderLayout,
     color: Rgba,
@@ -1978,6 +2143,23 @@ fn push_search_rect(
         color,
         layer: RectLayer::Background,
     });
+
+    for span in &snapshot.cell_spans {
+        let Ok(row) = usize::try_from(span.anchor.row) else {
+            continue;
+        };
+        if !search_match.contains(span.anchor.col, row) {
+            continue;
+        }
+        rects.push(RectPlan {
+            x: layout.cell_x(span.anchor.col),
+            y: layout.cell_y(row),
+            width: u32::from(span.columns).saturating_mul(layout.metrics.width),
+            height: u32::from(span.rows).saturating_mul(layout.metrics.height),
+            color,
+            layer: RectLayer::Background,
+        });
+    }
 }
 
 fn push_search_bar(
@@ -2019,6 +2201,7 @@ fn push_search_bar(
             underline: false,
             inverse: false,
         },
+        cell_span: false,
     });
 }
 
@@ -2067,6 +2250,7 @@ fn push_tab_bar(
             underline: false,
             inverse: false,
         },
+        cell_span: false,
     });
 }
 
@@ -2212,6 +2396,7 @@ fn push_ime_preedit(
                 underline: false,
                 inverse: false,
             },
+            cell_span: false,
         });
     }
 }
@@ -3720,8 +3905,9 @@ mod tests {
         RectLayer, RectPlan, RenderOptions, RendererAppearance, Rgba, SearchMatch, TextStyle,
         UvRect, attrs_for_style, background_pass_rects, build_render_plan,
         build_render_plan_with_appearance, build_render_plan_with_options, builtin_theme,
-        builtin_theme_names, clamp_blur_radius, clamp_opacity, effect_overlay_rects, image_quad,
-        image_vertices, inline_image_cache_changes, resolve_theme_name, unique_font_family_infos,
+        builtin_theme_names, cell_span_scale, clamp_blur_radius, clamp_opacity,
+        effect_overlay_rects, image_quad, image_vertices, inline_image_cache_changes,
+        resolve_theme_name, unique_font_family_infos,
     };
     use glyphon::Family;
     use glyphon::cosmic_text::FeatureTag;
@@ -3835,6 +4021,99 @@ mod tests {
                 && !segment.style.bold
                 && !segment.style.italic
         }));
+    }
+
+    #[test]
+    fn render_plan_emits_one_scaled_text_segment_for_cell_span() {
+        let mut terminal = Terminal::new(8, 4);
+        terminal.feed(b"\x1b[2;3H");
+        terminal.place_cell_span("界", 3, 2).unwrap();
+        let metrics = CellMetrics {
+            width: 10,
+            height: 20,
+            font_size: 16.0,
+            line_height: 20.0,
+        };
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
+        let spans = plan
+            .text
+            .iter()
+            .filter(|segment| segment.cell_span)
+            .collect::<Vec<_>>();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "界");
+        assert_eq!(spans[0].x, 20);
+        assert_eq!(spans[0].y, 20);
+        assert_eq!(spans[0].width, 30);
+        assert_eq!(spans[0].height, 40);
+        assert!(
+            !plan
+                .text
+                .iter()
+                .any(|segment| !segment.cell_span && segment.text == "界")
+        );
+    }
+
+    #[test]
+    fn cell_span_scale_uses_glyph_advance_instead_of_cell_occupancy() {
+        assert_eq!(cell_span_scale(10.0, 30.0, 100.0, 20.0), Some(3.0));
+        assert_eq!(cell_span_scale(15.0, 30.0, 100.0, 20.0), Some(2.0));
+        assert_eq!(cell_span_scale(10.0, 30.0, 40.0, 20.0), Some(2.0));
+        assert_eq!(cell_span_scale(0.0, 30.0, 40.0, 20.0), None);
+    }
+
+    #[test]
+    fn render_plan_expands_search_match_to_entire_cell_span() {
+        let mut terminal = Terminal::new(8, 4);
+        terminal.feed(b"\x1b[2;3H");
+        terminal.place_cell_span("A", 3, 2).unwrap();
+        let metrics = CellMetrics::default();
+        let appearance = RendererAppearance::default();
+
+        let plan = build_render_plan_with_options(
+            &terminal.snapshot(),
+            &Damage::Full,
+            metrics,
+            RenderOptions {
+                search_matches: vec![SearchMatch {
+                    row: 1,
+                    start_col: 2,
+                    end_col: 3,
+                }],
+                ..RenderOptions::default()
+            },
+        );
+
+        assert!(plan.rects.iter().any(|rect| {
+            rect.x == metrics.width * 2
+                && rect.y == metrics.height
+                && rect.width == metrics.width * 3
+                && rect.height == metrics.height * 2
+                && rect.color == appearance.search.background
+        }));
+    }
+
+    #[test]
+    fn render_plan_draws_cell_span_underline_once_at_rectangle_bottom() {
+        let mut terminal = Terminal::new(8, 4);
+        terminal.feed(b"\x1b[4m");
+        terminal.place_cell_span("A", 3, 2).unwrap();
+        let metrics = CellMetrics::default();
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
+        let matching = plan
+            .rects
+            .iter()
+            .filter(|rect| {
+                rect.layer == RectLayer::Overlay
+                    && rect.width == metrics.width * 3
+                    && rect.y == metrics.height * 2 - 2
+            })
+            .count();
+
+        assert_eq!(matching, 1);
     }
 
     #[test]

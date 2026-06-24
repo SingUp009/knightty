@@ -11,6 +11,7 @@ use knightty_core::{
     MouseButton as TerminalMouseButton, MouseEventKind, MouseProtocol, SelectionMode,
     SelectionPoint, Terminal, TerminalMouseEvent,
 };
+use knightty_proto::cell_span::parse_cell_span;
 use knightty_proto::iterm2::parse_iterm2_inline_image;
 use knightty_proto::kitty::{
     GraphicsEscapeRouter, GraphicsStreamItem, KittyAction, KittyCommand, KittyContinuation,
@@ -399,6 +400,23 @@ impl<P: InputPorts> InputRouter<P> {
                 PtyStreamItem::InlineImage(sequence) => self.handle_inline_image(sequence),
                 PtyStreamItem::InvalidInlineImage => {
                     eprintln!("knightty inline image: ignored non-UTF-8 OSC 1337 metadata");
+                }
+                PtyStreamItem::CellSpan(sequence) => match parse_cell_span(sequence) {
+                    Ok(command) => {
+                        if let Err(error) = self.terminal.place_cell_span(
+                            command.text,
+                            command.columns,
+                            command.rows,
+                        ) {
+                            eprintln!("knightty cell span: ignored command: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("knightty cell span: ignored invalid OSC 7777: {error:?}");
+                    }
+                },
+                PtyStreamItem::InvalidCellSpan => {
+                    eprintln!("knightty cell span: ignored non-UTF-8 OSC 7777 payload");
                 }
             }
         }
@@ -1055,9 +1073,13 @@ impl<P: InputPorts> InputRouter<P> {
     }
 
     pub fn handle_cursor_moved(&mut self, cell: Option<(usize, usize)>) {
+        let previous_cell = self.cursor_cell;
         self.cursor_cell = cell;
         if self.selection_drag_active {
             self.clear_hover_hyperlink();
+            if previous_cell != cell {
+                self.selection_drag_moved = true;
+            }
             if let Some(point) = self.cursor_selection_point() {
                 if self.selection_drag_anchor != Some(point) {
                     self.selection_drag_moved = true;
@@ -2250,6 +2272,50 @@ mod harness_tests {
         assert_eq!(snapshot.image_placements.len(), 1);
         assert_eq!(snapshot.image_placements[0].anchor.col, 1);
         assert_eq!(app.router.inline_images_for_snapshot(&snapshot).len(), 1);
+    }
+
+    #[test]
+    fn split_utf8_cell_span_osc_is_parsed_placed_and_kept_out_of_terminal_text() {
+        let mut app = AppHarness::new();
+        let sequence = "\x1b]7777;knightty;span=4x2:👨‍💻\x1b\\";
+        let emoji_start = sequence.find('👨').unwrap();
+        let split = emoji_start + 2;
+
+        app.feed(&sequence.as_bytes()[..split]);
+        assert!(app.router.snapshot().cell_spans.is_empty());
+        app.feed(&sequence.as_bytes()[split..]);
+
+        let snapshot = app.router.snapshot();
+        assert_eq!(snapshot.cell_spans.len(), 1);
+        assert_eq!(snapshot.cell_spans[0].text, "👨‍💻");
+        assert_eq!(snapshot.cell_spans[0].columns, 4);
+        assert_eq!(snapshot.cell_spans[0].rows, 2);
+        assert_eq!(snapshot.cursor.x, 0);
+        assert_eq!(snapshot.cursor.y, 0);
+    }
+
+    #[test]
+    fn invalid_cell_span_osc_does_not_change_grid_or_cursor() {
+        let mut app = AppHarness::new();
+        let before = app.router.snapshot();
+
+        app.feed(b"\x1b]7777;knightty;span=2x2:AB\x07");
+
+        let after = app.router.snapshot();
+        assert!(after.cell_spans.is_empty());
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.cell(0, 0), before.cell(0, 0));
+    }
+
+    #[test]
+    fn selecting_any_cell_in_cell_span_copies_the_grapheme_once() {
+        let mut app = AppHarness::new();
+        app.feed("\x1b]7777;knightty;span=4x2:e\u{301}\x07".as_bytes());
+
+        app.left_drag((1, 1), (2, 1));
+        app.copy_shortcut();
+
+        assert_eq!(app.clipboard(), "e\u{301}");
     }
 
     #[test]

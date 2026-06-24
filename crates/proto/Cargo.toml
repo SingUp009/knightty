@@ -12,3 +12,4 @@ path = "src/lib.rs"
 [dependencies]
 base64 = "0.22.1"
 knightty_core = { package = "core", version = "0.1.0", path = "../core" }
+unicode-segmentation = "1.13.3"

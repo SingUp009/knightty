@@ -16,12 +16,14 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags as AlacrittyFlags;
+use alacritty_terminal::term::cell::{Cell as AlacrittyCell, Flags as AlacrittyFlags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color as AlacrittyColor, NamedColor, Processor, Rgb as AlacrittyRgb,
+    Color as AlacrittyColor, Handler, NamedColor, Processor, Rgb as AlacrittyRgb,
 };
+use thiserror::Error;
+use unicode_width::UnicodeWidthStr;
 
 /// GUI-independent terminal state wrapper.
 pub struct Terminal {
@@ -36,6 +38,29 @@ pub struct Terminal {
     mouse_state: MouseModeState,
     selection: Option<SelectionState>,
     image_placements: Vec<ImagePlacement>,
+    cell_spans: Vec<CellSpanState>,
+    next_cell_span_marker: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellSpanScreen {
+    Primary,
+    Alternate,
+}
+
+#[derive(Clone, Debug)]
+struct CellSpanState {
+    marker: char,
+    screen: CellSpanScreen,
+    anchor: GridPoint,
+    columns: u16,
+    rows: u16,
+    text: String,
+    terminal_width: usize,
+    render_cell: Cell,
+    hyperlink: Option<Hyperlink>,
+    template: AlacrittyCell,
+    released_on_resize: bool,
 }
 
 /// Enabled xterm mouse reporting protocol.
@@ -202,6 +227,30 @@ pub struct ImagePlacement {
     pub z_index: ImageZIndex,
 }
 
+/// One Unicode grapheme rendered inside a rectangular logical-cell span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CellSpanPlacement {
+    pub anchor: GridPoint,
+    pub columns: u16,
+    pub rows: u16,
+    pub text: String,
+    pub cell: Cell,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CellSpanError {
+    #[error("cell span text is empty")]
+    EmptyText,
+    #[error("cell span text is wider than one terminal glyph")]
+    TextTooWide,
+    #[error("cell span dimensions are zero")]
+    ZeroDimension,
+    #[error("cell span dimensions exceed the current terminal grid")]
+    ExceedsGrid,
+    #[error("cell span is narrower than the grapheme's terminal width")]
+    TooNarrow,
+}
+
 impl Terminal {
     /// Create a terminal with the provided visible grid size.
     ///
@@ -244,14 +293,20 @@ impl Terminal {
             mouse_state: MouseModeState::default(),
             selection: None,
             image_placements: Vec::new(),
+            cell_spans: Vec::new(),
+            next_cell_span_marker: CELL_SPAN_MARKER_START,
         }
     }
 
     /// Resize the visible grid.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.clear_selection();
+        self.materialize_active_cell_spans();
         let size = TermSize::new(cols.max(1), rows.max(1));
         self.term.resize(size);
+        for span in &mut self.cell_spans {
+            span.released_on_resize = true;
+        }
         self.damage = Damage::Full;
         self.term.reset_damage();
     }
@@ -343,6 +398,301 @@ impl Terminal {
     /// Return placements in live-screen logical coordinates before viewport transforms.
     pub fn logical_image_placements(&self) -> &[ImagePlacement] {
         &self.image_placements
+    }
+
+    /// Place one Unicode grapheme inside a rectangular cell span.
+    pub fn place_cell_span(
+        &mut self,
+        text: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Result<(), CellSpanError> {
+        if columns == 0 || rows == 0 {
+            return Err(CellSpanError::ZeroDimension);
+        }
+        if text.is_empty() {
+            return Err(CellSpanError::EmptyText);
+        }
+        let terminal_width = UnicodeWidthStr::width(text);
+        if terminal_width > 2 {
+            return Err(CellSpanError::TextTooWide);
+        }
+        if usize::from(columns) < terminal_width {
+            return Err(CellSpanError::TooNarrow);
+        }
+
+        let (grid_columns, grid_rows) = self.size();
+        if usize::from(columns) > grid_columns || usize::from(rows) > grid_rows {
+            return Err(CellSpanError::ExceedsGrid);
+        }
+        self.clear_selection();
+        self.scroll_to_bottom();
+
+        let cursor_column = self.term.grid().cursor.point.column.0;
+        if cursor_column.saturating_add(usize::from(columns)) > grid_columns {
+            let previous_history = self.term.grid().history_size();
+            self.processor.advance(&mut self.term, b"\r\n");
+            self.apply_output_scroll(previous_history);
+            self.reconcile_active_cell_spans();
+        }
+
+        let cursor = self.term.grid().cursor.point;
+        let desired_column = cursor.column.0;
+        let cursor_row = usize::try_from(cursor.line.0).unwrap_or(0);
+        let overflow = cursor_row
+            .saturating_add(usize::from(rows))
+            .saturating_sub(grid_rows);
+        if overflow != 0 {
+            let previous_history = self.term.grid().history_size();
+            for _ in 0..overflow {
+                self.processor.advance(&mut self.term, b"\r\n");
+            }
+            self.apply_output_scroll(previous_history);
+            self.reconcile_active_cell_spans();
+            self.term.goto(
+                i32::try_from(cursor_row.saturating_sub(overflow)).unwrap_or(0),
+                desired_column,
+            );
+        }
+
+        let cursor = self.term.grid().cursor.point;
+        let anchor = GridPoint {
+            col: cursor.column.0,
+            row: isize::try_from(cursor.line.0).unwrap_or(0),
+        };
+        let screen = self.current_cell_span_screen();
+        self.remove_overlapping_cell_spans(screen, anchor, columns, rows);
+
+        let marker = self.allocate_cell_span_marker();
+        let template = self.term.grid().cursor.template.clone();
+        let hyperlink = template.hyperlink().and_then(hyperlink_from_alacritty);
+        let first = text.chars().next().ok_or(CellSpanError::EmptyText)?;
+        let mut render_source = template.clone();
+        render_source.c = first;
+        let mut render_cell = Cell::from_alacritty(&render_source);
+        render_cell.ch = first;
+        render_cell.flags.wide = terminal_width == 2;
+        render_cell.flags.wide_spacer = false;
+
+        {
+            let grid = self.term.grid_mut();
+            for row_offset in 0..usize::from(rows) {
+                let line = Line(
+                    i32::try_from(anchor.row.saturating_add(row_offset as isize)).unwrap_or(0),
+                );
+                for column_offset in 0..usize::from(columns) {
+                    let mut marker_cell = template.clone();
+                    marker_cell.c = marker;
+                    marker_cell.extra = None;
+                    marker_cell.flags.remove(
+                        AlacrittyFlags::WIDE_CHAR
+                            | AlacrittyFlags::WIDE_CHAR_SPACER
+                            | AlacrittyFlags::LEADING_WIDE_CHAR_SPACER
+                            | AlacrittyFlags::WRAPLINE,
+                    );
+                    grid[line][Column(anchor.col + column_offset)] = marker_cell;
+                }
+            }
+        }
+
+        self.cell_spans.push(CellSpanState {
+            marker,
+            screen,
+            anchor,
+            columns,
+            rows,
+            text: text.to_owned(),
+            terminal_width,
+            render_cell,
+            hyperlink,
+            template,
+            released_on_resize: false,
+        });
+        self.mark_full_damage();
+        self.term
+            .goto(i32::try_from(anchor.row).unwrap_or(0), anchor.col);
+        Ok(())
+    }
+
+    fn current_cell_span_screen(&self) -> CellSpanScreen {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            CellSpanScreen::Alternate
+        } else {
+            CellSpanScreen::Primary
+        }
+    }
+
+    fn allocate_cell_span_marker(&mut self) -> char {
+        loop {
+            let value = self.next_cell_span_marker;
+            self.next_cell_span_marker = if value >= CELL_SPAN_MARKER_END {
+                CELL_SPAN_MARKER_START
+            } else {
+                value + 1
+            };
+            let marker = char::from_u32(value).expect("private-use marker is a valid scalar");
+            if !self.cell_spans.iter().any(|span| span.marker == marker) {
+                return marker;
+            }
+        }
+    }
+
+    fn remove_overlapping_cell_spans(
+        &mut self,
+        screen: CellSpanScreen,
+        anchor: GridPoint,
+        columns: u16,
+        rows: u16,
+    ) {
+        let markers = self
+            .cell_spans
+            .iter()
+            .filter(|span| {
+                span.screen == screen
+                    && cell_rects_intersect(
+                        span.anchor,
+                        span.columns,
+                        span.rows,
+                        anchor,
+                        columns,
+                        rows,
+                    )
+            })
+            .map(|span| span.marker)
+            .collect::<Vec<_>>();
+        if markers.is_empty() {
+            return;
+        }
+        for marker in &markers {
+            self.clear_marker_from_active_grid(*marker);
+        }
+        self.cell_spans
+            .retain(|span| !markers.contains(&span.marker));
+        self.mark_full_damage();
+    }
+
+    fn reconcile_active_cell_spans(&mut self) {
+        self.materialize_released_cell_spans();
+        let screen = self.current_cell_span_screen();
+        let mut updates = Vec::new();
+        let mut invalid = Vec::new();
+        {
+            let grid = self.term.grid();
+            for (index, span) in self.cell_spans.iter().enumerate() {
+                if span.screen != screen {
+                    continue;
+                }
+                let Some(anchor) = find_cell_span_marker(grid, span.marker) else {
+                    invalid.push(span.marker);
+                    continue;
+                };
+                if cell_span_markers_are_intact(grid, span.marker, anchor, span.columns, span.rows)
+                {
+                    updates.push((index, anchor));
+                } else {
+                    invalid.push(span.marker);
+                }
+            }
+        }
+
+        for (index, anchor) in updates {
+            self.cell_spans[index].anchor = anchor;
+        }
+        if invalid.is_empty() {
+            return;
+        }
+        for marker in &invalid {
+            self.clear_marker_from_active_grid(*marker);
+        }
+        self.cell_spans
+            .retain(|span| !invalid.contains(&span.marker));
+        self.mark_full_damage();
+    }
+
+    fn clear_marker_from_active_grid(&mut self, marker: char) {
+        let grid = self.term.grid_mut();
+        let top = grid.topmost_line().0;
+        let bottom = i32::try_from(grid.screen_lines()).unwrap_or(i32::MAX);
+        let columns = grid.columns();
+        for row in top..bottom {
+            for column in 0..columns {
+                let cell = &mut grid[Line(row)][Column(column)];
+                if cell.c == marker {
+                    *cell = AlacrittyCell::from(cell.bg);
+                }
+            }
+        }
+    }
+
+    fn materialize_active_cell_spans(&mut self) {
+        let screen = self.current_cell_span_screen();
+        let mut active = Vec::new();
+        self.cell_spans.retain(|span| {
+            if span.screen == screen {
+                active.push(span.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.materialize_cell_span_states(active, false);
+    }
+
+    fn materialize_released_cell_spans(&mut self) {
+        let screen = self.current_cell_span_screen();
+        let mut active = Vec::new();
+        self.cell_spans.retain(|span| {
+            if span.screen == screen && span.released_on_resize {
+                active.push(span.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if active.is_empty() {
+            return;
+        }
+        self.materialize_cell_span_states(active, true);
+        self.mark_full_damage();
+    }
+
+    fn materialize_cell_span_states(&mut self, active: Vec<CellSpanState>, require_marker: bool) {
+        for span in active {
+            let marker_anchor = find_cell_span_marker(self.term.grid(), span.marker);
+            if require_marker && marker_anchor.is_none() {
+                continue;
+            }
+            let anchor = marker_anchor.unwrap_or(span.anchor);
+            self.clear_marker_from_active_grid(span.marker);
+            let Some(line) = line_for_row(anchor.row) else {
+                continue;
+            };
+            if line < self.term.grid().topmost_line()
+                || line.0 >= i32::try_from(self.term.grid().screen_lines()).unwrap_or(i32::MAX)
+                || anchor.col >= self.term.grid().columns()
+            {
+                continue;
+            }
+            let mut cell = span.template.clone();
+            let mut chars = span.text.chars();
+            let Some(first) = chars.next() else {
+                continue;
+            };
+            cell.c = first;
+            for ch in chars {
+                cell.push_zerowidth(ch);
+            }
+            if span.terminal_width == 2 {
+                cell.flags.insert(AlacrittyFlags::WIDE_CHAR);
+            }
+            let bg = cell.bg;
+            self.term.grid_mut()[line][Column(anchor.col)] = cell;
+            if span.terminal_width == 2 && anchor.col + 1 < self.term.grid().columns() {
+                let mut spacer = AlacrittyCell::from(bg);
+                spacer.flags.insert(AlacrittyFlags::WIDE_CHAR_SPACER);
+                self.term.grid_mut()[line][Column(anchor.col + 1)] = spacer;
+            }
+        }
     }
 
     /// Advance the terminal cursor after displaying a block image.
@@ -486,6 +836,7 @@ impl Terminal {
         }
         self.apply_title_events();
         self.apply_output_scroll(previous_history);
+        self.reconcile_active_cell_spans();
 
         let damage = self.collect_damage();
         self.damage = merge_damage(core::mem::replace(&mut self.damage, Damage::None), damage);
@@ -586,10 +937,19 @@ impl Terminal {
             return None;
         }
 
-        let point = SelectionPoint {
+        let mut point = SelectionPoint {
             col,
             row: usize_to_isize(row).saturating_sub(usize_to_isize(grid.display_offset())),
         };
+        if let Some(span) = self.cell_spans.iter().find(|span| {
+            span.screen == self.current_cell_span_screen()
+                && cell_span_state_contains(span, point.col, point.row)
+        }) {
+            point = SelectionPoint {
+                col: span.anchor.col,
+                row: span.anchor.row,
+            };
+        }
         self.clamp_selection_point(point)
     }
 
@@ -716,6 +1076,28 @@ impl Terminal {
             });
         }
 
+        for span in self.cell_spans.iter().filter(|span| {
+            span.screen == self.current_cell_span_screen()
+                && selection_range_contains(&range, span.anchor.col, span.anchor.row)
+        }) {
+            for row_offset in 0..usize::from(span.rows) {
+                let logical_row = span.anchor.row.saturating_add(row_offset as isize);
+                let visible_row = logical_row.saturating_add(display_offset);
+                let Ok(visible_row) = usize::try_from(visible_row) else {
+                    continue;
+                };
+                if visible_row >= rows || span.anchor.col >= cols {
+                    continue;
+                }
+                rects.push(SelectionRect {
+                    col: span.anchor.col,
+                    row: visible_row,
+                    width: usize::from(span.columns).min(cols - span.anchor.col),
+                    height: 1,
+                });
+            }
+        }
+
         rects
     }
 
@@ -741,6 +1123,13 @@ impl Terminal {
         let mut cells = vec![Cell::default(); cols * rows];
         let mut hyperlinks = Vec::new();
         let mut hyperlink_indexes = HashMap::<Hyperlink, usize>::new();
+        let active_screen = self.current_cell_span_screen();
+        let active_span_markers = self
+            .cell_spans
+            .iter()
+            .filter(|span| span.screen == active_screen)
+            .map(|span| span.marker)
+            .collect::<Vec<_>>();
         let image_placements = self
             .image_placements
             .iter()
@@ -773,8 +1162,15 @@ impl Terminal {
                 continue;
             }
 
+            let is_span_marker = active_span_markers.contains(&indexed.cell.c);
             let mut cell = Cell::from_alacritty(indexed.cell);
-            if let Some(hyperlink) = indexed.cell.hyperlink().and_then(hyperlink_from_alacritty) {
+            if is_span_marker {
+                cell.ch = ' ';
+                cell.flags = CellFlags::default();
+                cell.hyperlink = None;
+            } else if let Some(hyperlink) =
+                indexed.cell.hyperlink().and_then(hyperlink_from_alacritty)
+            {
                 let hyperlink_index =
                     if let Some(index) = hyperlink_indexes.get(&hyperlink).copied() {
                         index
@@ -787,6 +1183,75 @@ impl Terminal {
                 cell.hyperlink = Some(hyperlink_index);
             }
             cells[y * cols + x] = cell;
+        }
+
+        let mut cell_spans = Vec::new();
+        for span in self
+            .cell_spans
+            .iter()
+            .filter(|span| span.screen == active_screen)
+        {
+            let visible_row = span.anchor.row.saturating_add(display_offset as isize);
+            let visible_bottom =
+                visible_row.saturating_add(isize::try_from(span.rows).unwrap_or(isize::MAX));
+            if visible_bottom <= 0 || visible_row >= rows as isize {
+                continue;
+            }
+
+            let mut styled_cell = span.render_cell.clone();
+            if let Some(hyperlink) = &span.hyperlink {
+                let hyperlink_index = if let Some(index) = hyperlink_indexes.get(hyperlink).copied()
+                {
+                    index
+                } else {
+                    let index = hyperlinks.len();
+                    hyperlinks.push(hyperlink.clone());
+                    hyperlink_indexes.insert(hyperlink.clone(), index);
+                    index
+                };
+                styled_cell.hyperlink = Some(hyperlink_index);
+            }
+
+            for row_offset in 0..usize::from(span.rows) {
+                let visible_y = visible_row.saturating_add(row_offset as isize);
+                let Ok(visible_y) = usize::try_from(visible_y) else {
+                    continue;
+                };
+                if visible_y >= rows {
+                    continue;
+                }
+                for column_offset in 0..usize::from(span.columns) {
+                    let x = span.anchor.col.saturating_add(column_offset);
+                    if x >= cols {
+                        continue;
+                    }
+                    let mut background_cell = styled_cell.clone();
+                    background_cell.ch = ' ';
+                    background_cell.flags.wide = false;
+                    background_cell.flags.wide_spacer = false;
+                    background_cell.flags.underline = false;
+                    cells[visible_y * cols + x] = background_cell;
+                }
+            }
+
+            if let Ok(anchor_y) = usize::try_from(visible_row)
+                && anchor_y < rows
+                && span.anchor.col < cols
+            {
+                let mut anchor_cell = styled_cell.clone();
+                anchor_cell.flags.underline = false;
+                cells[anchor_y * cols + span.anchor.col] = anchor_cell;
+            }
+            cell_spans.push(CellSpanPlacement {
+                anchor: GridPoint {
+                    col: span.anchor.col,
+                    row: visible_row,
+                },
+                columns: span.columns,
+                rows: span.rows,
+                text: span.text.clone(),
+                cell: styled_cell,
+            });
         }
 
         let cursor_point = grid.cursor.point;
@@ -804,6 +1269,7 @@ impl Terminal {
             hyperlinks,
             selection_rects: self.selection_rects(),
             image_placements,
+            cell_spans,
             cursor: Cursor {
                 x: cursor_x,
                 y: cursor_y,
@@ -911,7 +1377,18 @@ impl Terminal {
                 let anchor = self.clamp_selection_point(selection.anchor)?;
                 let focus = self.clamp_selection_point(selection.focus)?;
                 if anchor == focus {
-                    return None;
+                    return self
+                        .cell_spans
+                        .iter()
+                        .any(|span| {
+                            span.screen == self.current_cell_span_screen()
+                                && span.anchor.col == anchor.col
+                                && span.anchor.row == anchor.row
+                        })
+                        .then_some(SelectionRange {
+                            start: anchor,
+                            end: focus,
+                        });
                 }
                 Some(SelectionRange::normalized(anchor, focus))
             }
@@ -993,6 +1470,12 @@ impl Terminal {
     }
 
     fn cell_char(&self, row: isize, col: usize) -> Option<char> {
+        if let Some(span) = self.cell_spans.iter().find(|span| {
+            span.screen == self.current_cell_span_screen()
+                && cell_span_state_contains(span, col, row)
+        }) {
+            return span.text.chars().next();
+        }
         let grid = self.term.grid();
         if col >= grid.columns() {
             return None;
@@ -1027,6 +1510,15 @@ impl Terminal {
 
         let mut text = String::new();
         for col in start_col..=end_col {
+            if let Some(span) = self.cell_spans.iter().find(|span| {
+                span.screen == self.current_cell_span_screen()
+                    && cell_span_state_contains(span, col, row)
+            }) {
+                if span.anchor.col == col && span.anchor.row == row {
+                    text.push_str(&span.text);
+                }
+                continue;
+            }
             let cell = &grid[line][Column(col)];
             if cell.flags.intersects(WIDE_SPACER_FLAGS) {
                 continue;
@@ -1131,6 +1623,8 @@ impl Terminal {
 }
 
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+const CELL_SPAN_MARKER_START: u32 = 0xF0000;
+const CELL_SPAN_MARKER_END: u32 = 0xFFFFD;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const WIDE_SPACER_FLAGS: AlacrittyFlags =
@@ -1142,6 +1636,104 @@ const MAX_COMPAT_CSI_LEN: usize = 64;
 const MAX_WINDOW_TITLE_CHARS: usize = 1024;
 const MAX_HYPERLINK_URI_BYTES: usize = 2048;
 const MAX_HYPERLINK_ID_BYTES: usize = 1024;
+
+fn cell_rects_intersect(
+    left_anchor: GridPoint,
+    left_columns: u16,
+    left_rows: u16,
+    right_anchor: GridPoint,
+    right_columns: u16,
+    right_rows: u16,
+) -> bool {
+    let left_right = left_anchor.col.saturating_add(usize::from(left_columns));
+    let right_right = right_anchor.col.saturating_add(usize::from(right_columns));
+    let left_bottom = left_anchor
+        .row
+        .saturating_add(isize::try_from(left_rows).unwrap_or(0));
+    let right_bottom = right_anchor
+        .row
+        .saturating_add(isize::try_from(right_rows).unwrap_or(0));
+    left_anchor.col < right_right
+        && right_anchor.col < left_right
+        && left_anchor.row < right_bottom
+        && right_anchor.row < left_bottom
+}
+
+fn cell_span_state_contains(span: &CellSpanState, col: usize, row: isize) -> bool {
+    col >= span.anchor.col
+        && col < span.anchor.col.saturating_add(usize::from(span.columns))
+        && row >= span.anchor.row
+        && row
+            < span
+                .anchor
+                .row
+                .saturating_add(isize::try_from(span.rows).unwrap_or(isize::MAX))
+}
+
+fn cell_span_contains_visible_cell(span: &CellSpanPlacement, col: usize, row: usize) -> bool {
+    let Ok(span_row) = usize::try_from(span.anchor.row) else {
+        return false;
+    };
+    col >= span.anchor.col
+        && col < span.anchor.col.saturating_add(usize::from(span.columns))
+        && row >= span_row
+        && row < span_row.saturating_add(usize::from(span.rows))
+}
+
+fn selection_range_contains(range: &SelectionRange, col: usize, row: isize) -> bool {
+    selection_point_le(range.start, SelectionPoint { col, row })
+        && selection_point_le(SelectionPoint { col, row }, range.end)
+}
+
+fn find_cell_span_marker(
+    grid: &alacritty_terminal::grid::Grid<AlacrittyCell>,
+    marker: char,
+) -> Option<GridPoint> {
+    let top = grid.topmost_line().0;
+    let bottom = i32::try_from(grid.screen_lines()).unwrap_or(i32::MAX);
+    for row in top..bottom {
+        for column in 0..grid.columns() {
+            if grid[Line(row)][Column(column)].c == marker {
+                return Some(GridPoint {
+                    col: column,
+                    row: row as isize,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn cell_span_markers_are_intact(
+    grid: &alacritty_terminal::grid::Grid<AlacrittyCell>,
+    marker: char,
+    anchor: GridPoint,
+    columns: u16,
+    rows: u16,
+) -> bool {
+    if anchor.col.saturating_add(usize::from(columns)) > grid.columns() {
+        return false;
+    }
+    let top = grid.topmost_line().0 as isize;
+    let bottom = isize::try_from(grid.screen_lines()).unwrap_or(isize::MAX);
+    let span_bottom = anchor
+        .row
+        .saturating_add(isize::try_from(rows).unwrap_or(0));
+    if anchor.row < top || span_bottom > bottom {
+        return false;
+    }
+
+    for row_offset in 0..usize::from(rows) {
+        let line =
+            Line(i32::try_from(anchor.row.saturating_add(row_offset as isize)).unwrap_or(i32::MAX));
+        for column_offset in 0..usize::from(columns) {
+            if grid[line][Column(anchor.col + column_offset)].c != marker {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 fn sanitize_window_title(title: &str) -> String {
     title
@@ -1539,6 +2131,7 @@ pub struct GridSnapshot {
     pub hyperlinks: Vec<Hyperlink>,
     pub selection_rects: Vec<SelectionRect>,
     pub image_placements: Vec<ImagePlacement>,
+    pub cell_spans: Vec<CellSpanPlacement>,
     pub cursor: Cursor,
 }
 
@@ -1552,7 +2145,12 @@ impl GridSnapshot {
             return None;
         }
 
-        let hyperlink_index = self.cell(x, y).hyperlink?;
+        let hyperlink_index = self
+            .cell_spans
+            .iter()
+            .find(|span| cell_span_contains_visible_cell(span, x, y))
+            .and_then(|span| span.cell.hyperlink)
+            .or_else(|| self.cell(x, y).hyperlink)?;
         self.hyperlinks.get(hyperlink_index)
     }
 
@@ -1718,10 +2316,11 @@ fn merge_damage(current: Damage, next: Damage) -> Damage {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, Damage, GridPoint, ImageId, ImagePixelOffset, ImagePlacement, ImagePlacementId,
-        ImageSourceRect, ImageZIndex, MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URI_BYTES,
-        MAX_WINDOW_TITLE_CHARS, MouseButton, MouseEncoding, MouseEventKind, MouseModes,
-        MouseProtocol, SelectionMode, SelectionPoint, SelectionRect, Terminal, TerminalMouseEvent,
+        CellSpanError, Color, Damage, GridPoint, ImageId, ImagePixelOffset, ImagePlacement,
+        ImagePlacementId, ImageSourceRect, ImageZIndex, MAX_HYPERLINK_ID_BYTES,
+        MAX_HYPERLINK_URI_BYTES, MAX_WINDOW_TITLE_CHARS, MouseButton, MouseEncoding,
+        MouseEventKind, MouseModes, MouseProtocol, SelectionMode, SelectionPoint, SelectionRect,
+        Terminal, TerminalMouseEvent,
     };
     use std::collections::BTreeSet;
 
@@ -3137,6 +3736,210 @@ mod tests {
         term.feed(b"\x1bc");
 
         assert!(term.snapshot().image_placements.is_empty());
+    }
+
+    #[test]
+    fn cell_span_uses_cursor_as_top_left_anchor_and_keeps_cursor_there() {
+        let mut term = Terminal::new(10, 4);
+        term.feed(b"\x1b[2;3H");
+
+        term.place_cell_span("界", 3, 2).unwrap();
+
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cursor.x, 2);
+        assert_eq!(snapshot.cursor.y, 1);
+        assert_eq!(snapshot.cell_spans.len(), 1);
+        assert_eq!(snapshot.cell_spans[0].anchor, GridPoint { col: 2, row: 1 });
+        assert_eq!(snapshot.cell_spans[0].columns, 3);
+        assert_eq!(snapshot.cell_spans[0].rows, 2);
+        assert_eq!(snapshot.cell_spans[0].text, "界");
+        assert_eq!(snapshot.cell(2, 1).ch, '界');
+    }
+
+    #[test]
+    fn cell_span_rejects_invalid_size_without_moving_cursor_or_changing_grid() {
+        let mut term = Terminal::new(5, 2);
+        term.feed(b"A\x1b[1;3H");
+        let before = term.snapshot();
+
+        assert_eq!(
+            term.place_cell_span("界", 1, 1),
+            Err(CellSpanError::TooNarrow)
+        );
+        assert_eq!(
+            term.place_cell_span("A", 6, 1),
+            Err(CellSpanError::ExceedsGrid)
+        );
+
+        let after = term.snapshot();
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.cell(0, 0), before.cell(0, 0));
+        assert!(after.cell_spans.is_empty());
+    }
+
+    #[test]
+    fn zero_width_grapheme_can_use_cell_span_and_fall_back_during_rendering() {
+        let mut term = Terminal::new(5, 2);
+
+        term.place_cell_span("\u{301}", 1, 1).unwrap();
+
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cell_spans[0].text, "\u{301}");
+        assert_eq!(snapshot.cursor.x, 0);
+        assert_eq!(snapshot.cursor.y, 0);
+    }
+
+    #[test]
+    fn writing_inside_cell_span_removes_the_entire_placement_atomically() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("A", 3, 2).unwrap();
+        term.feed(b"\x1b[2;2H\x1b[X");
+
+        let snapshot = term.snapshot();
+        assert!(snapshot.cell_spans.is_empty());
+        assert_eq!(snapshot.cell(0, 0).ch, ' ');
+        assert_eq!(snapshot.cell(1, 0).ch, ' ');
+        assert_eq!(snapshot.cell(2, 1).ch, ' ');
+    }
+
+    #[test]
+    fn writing_after_cell_span_overwrites_anchor_and_removes_reservation() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("界", 3, 2).unwrap();
+
+        term.feed(b"Z");
+
+        let snapshot = term.snapshot();
+        assert!(snapshot.cell_spans.is_empty());
+        assert_eq!(snapshot.cell(0, 0).ch, 'Z');
+        assert_eq!(snapshot.cell(1, 0).ch, ' ');
+    }
+
+    #[test]
+    fn cell_span_wraps_before_placement_when_it_does_not_fit_right_edge() {
+        let mut term = Terminal::new(5, 4);
+        term.feed(b"\x1b[1;5H");
+
+        term.place_cell_span("A", 2, 2).unwrap();
+
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cell_spans[0].anchor, GridPoint { col: 0, row: 1 });
+        assert_eq!(snapshot.cursor.x, 0);
+        assert_eq!(snapshot.cursor.y, 1);
+    }
+
+    #[test]
+    fn cell_span_scrolls_enough_rows_to_fit_at_bottom() {
+        let mut term = Terminal::new(5, 3);
+        term.feed(b"\x1b[3;2H");
+
+        term.place_cell_span("A", 2, 2).unwrap();
+
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cell_spans[0].anchor, GridPoint { col: 1, row: 1 });
+        assert_eq!(snapshot.cursor.x, 1);
+        assert_eq!(snapshot.cursor.y, 1);
+        assert_eq!(term.scrollback_len(), 1);
+    }
+
+    #[test]
+    fn selection_from_any_cell_in_span_copies_grapheme_once_and_highlights_rectangle() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("e\u{301}", 3, 2).unwrap();
+        let point = term.selection_point_for_visible_cell(2, 1).unwrap();
+        assert_eq!(point, SelectionPoint { col: 0, row: 0 });
+
+        term.begin_selection(point, SelectionMode::Simple);
+        term.update_selection(point);
+
+        assert_eq!(term.selected_text(), Some("e\u{301}".to_owned()));
+        let rects = term.selection_rects();
+        assert!(
+            rects
+                .iter()
+                .any(|rect| rect.col == 0 && rect.row == 0 && rect.width == 3)
+        );
+        assert!(
+            rects
+                .iter()
+                .any(|rect| rect.col == 0 && rect.row == 1 && rect.width == 3)
+        );
+    }
+
+    #[test]
+    fn cell_span_hyperlink_is_exposed_across_the_full_rectangle() {
+        let mut term = Terminal::new(8, 3);
+        term.feed(b"\x1b]8;id=span;https://example.com\x07");
+        term.place_cell_span("A", 3, 2).unwrap();
+
+        let link = term.hyperlink_at_cell(2, 1).unwrap();
+        assert_eq!(link.id.as_deref(), Some("span"));
+        assert_eq!(link.uri, "https://example.com");
+    }
+
+    #[test]
+    fn primary_and_alternate_screen_cell_spans_are_isolated() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("P", 2, 2).unwrap();
+
+        term.feed(b"\x1b[?1049h");
+        term.place_cell_span("A", 3, 1).unwrap();
+        assert_eq!(term.snapshot().cell_spans[0].text, "A");
+
+        term.feed(b"\x1b[?1049l");
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cell_spans.len(), 1);
+        assert_eq!(snapshot.cell_spans[0].text, "P");
+    }
+
+    #[test]
+    fn cell_span_follows_scrollback_and_is_discarded_after_history_eviction() {
+        let mut term = Terminal::with_scrollback(8, 3, 2);
+        term.place_cell_span("A", 2, 1).unwrap();
+        term.feed(b"\x1b[3;1H");
+        term.feed(b"one\r\ntwo\r\nthree");
+
+        assert!(term.snapshot().cell_spans.is_empty());
+        term.scroll_to_top();
+        assert_eq!(term.snapshot().cell_spans[0].text, "A");
+
+        term.scroll_to_bottom();
+        term.feed(b"\r\nfour\r\nfive\r\nsix");
+        term.scroll_to_top();
+        assert!(term.snapshot().cell_spans.is_empty());
+        assert!(term.cell_spans.is_empty());
+    }
+
+    #[test]
+    fn resizing_releases_cell_span_and_leaves_normal_anchor_grapheme() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("界", 3, 2).unwrap();
+
+        term.resize(10, 4);
+
+        let snapshot = term.snapshot();
+        assert!(snapshot.cell_spans.is_empty());
+        assert_eq!(snapshot.cell(0, 0).ch, '界');
+        assert!(snapshot.cell(1, 0).flags.wide_spacer);
+    }
+
+    #[test]
+    fn resizing_materializes_cell_spans_on_both_screens_and_restores_active_screen() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("P", 2, 1).unwrap();
+        term.feed(b"\x1b[?1049h");
+        term.place_cell_span("A", 2, 1).unwrap();
+
+        term.resize(10, 4);
+
+        let alternate = term.snapshot();
+        assert!(alternate.cell_spans.is_empty());
+        assert_eq!(alternate.cell(0, 0).ch, 'A');
+        term.feed(b"\x1b[?1049l");
+        let primary = term.snapshot();
+        assert!(primary.cell_spans.is_empty());
+        assert_eq!(primary.cell(0, 0).ch, 'P');
+        assert!(term.cell_spans.is_empty());
     }
 
     fn line_text(grid: &super::GridSnapshot, row: usize) -> String {

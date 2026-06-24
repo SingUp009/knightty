@@ -1487,14 +1487,12 @@ fn validate_kitty_chunk(payload: &[u8], more_chunks: bool) -> Result<(), KittyPr
 
 fn kitty_image_error(format: KittyFormat, error: InlineImageError) -> KittyProtocolError {
     match error {
-        InlineImageError::InvalidBase64 if format == KittyFormat::Png => {
-            KittyProtocolError::new(KittyErrorCode::BadPng, "invalid base64 in PNG payload")
-        }
-        InlineImageError::InvalidPng if format == KittyFormat::Png => {
+        InlineImageError::InvalidBase64
+        | InlineImageError::InvalidPng
+        | InlineImageError::ZeroDimension
+            if format == KittyFormat::Png =>
+        {
             KittyProtocolError::new(KittyErrorCode::BadPng, "invalid PNG image data")
-        }
-        InlineImageError::ZeroDimension if format == KittyFormat::Png => {
-            KittyProtocolError::new(KittyErrorCode::BadPng, "PNG has zero dimension")
         }
         InlineImageError::InvalidBase64
         | InlineImageError::InvalidPayloadLength

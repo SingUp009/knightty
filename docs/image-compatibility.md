@@ -226,3 +226,14 @@ On a Unix host, the raw PTY preservation E2E test is:
 ```sh
 cargo test -p pty --test unix_apc -- --nocapture
 ```
+
+This test was verified on 2026-06-21 under Arch Linux on WSL2
+(`6.6.87.2-microsoft-standard-WSL2`). The Unix PTY preserved the complete
+`q=0,m=0` 1x1 PNG APC byte-for-byte. The matching application smoke test also
+passed, confirming the router, PNG decode, and placement path on Linux:
+
+```sh
+cargo test -p app \
+  input::harness_tests::kitty_q0_m0_known_1x1_png_smoke_creates_a_placement \
+  -- --exact
+```

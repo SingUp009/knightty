@@ -860,6 +860,8 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_config: SurfaceConfiguration,
+    surface_needs_configure: bool,
+    surface_suspended: bool,
     cell_metrics: CellMetrics,
     font_family: Option<String>,
     appearance: RendererAppearance,
@@ -967,6 +969,8 @@ impl Renderer {
             device,
             queue,
             surface_config,
+            surface_needs_configure: false,
+            surface_suspended: false,
             cell_metrics,
             font_family: config.font_family,
             appearance,
@@ -1013,23 +1017,25 @@ impl Renderer {
         }
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, width: u32, height: u32) -> bool {
+        let surface_suspended = width == 0 || height == 0;
         let width = width.max(1);
         let height = height.max(1);
-        if self.surface_config.width == width && self.surface_config.height == height {
-            return;
+        if self.surface_config.width == width
+            && self.surface_config.height == height
+            && self.surface_suspended == surface_suspended
+        {
+            return false;
         }
 
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        self.surface_suspended = surface_suspended;
+        self.surface_needs_configure = !surface_suspended;
         for buffer in &mut self.text_buffers {
-            buffer.set_size(
-                &mut self.font_system,
-                Some(self.cell_metrics.width as f32 * 2.0),
-                Some(self.cell_metrics.height as f32),
-            );
+            reset_text_buffer_to_cell_defaults(buffer, &mut self.font_system, self.cell_metrics);
         }
+        true
     }
 
     pub fn recreate_surface<'window>(
@@ -1040,7 +1046,7 @@ impl Renderer {
         'window: 'static,
     {
         self.surface = self._instance.create_surface(target)?;
-        self.surface.configure(&self.device, &self.surface_config);
+        self.surface_needs_configure = !self.surface_suspended;
         Ok(())
     }
 
@@ -1050,6 +1056,11 @@ impl Renderer {
         damage: &Damage,
         options: RenderOptions,
     ) -> Result<(), RenderError> {
+        if self.surface_suspended {
+            return Ok(());
+        }
+        self.configure_surface_if_needed();
+
         let plan = build_render_plan_with_appearance(
             snapshot,
             damage,
@@ -1158,7 +1169,8 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 eprintln!("knightty renderer: surface outdated; reconfiguring");
-                self.surface.configure(&self.device, &self.surface_config);
+                self.surface_needs_configure = true;
+                self.configure_surface_if_needed();
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Lost => {
@@ -1229,6 +1241,14 @@ impl Renderer {
         self.atlas.trim();
 
         Ok(())
+    }
+
+    fn configure_surface_if_needed(&mut self) {
+        if self.surface_suspended || !self.surface_needs_configure {
+            return;
+        }
+        self.surface.configure(&self.device, &self.surface_config);
+        self.surface_needs_configure = false;
     }
 
     fn update_inline_image_cache(&mut self, images: &[InlineImageData]) {
@@ -1459,6 +1479,15 @@ fn new_text_buffer(font_system: &mut FontSystem, cell_metrics: CellMetrics) -> B
         font_system,
         Metrics::new(cell_metrics.font_size, cell_metrics.line_height),
     );
+    reset_text_buffer_to_cell_defaults(&mut buffer, font_system, cell_metrics);
+    buffer
+}
+
+fn reset_text_buffer_to_cell_defaults(
+    buffer: &mut Buffer,
+    font_system: &mut FontSystem,
+    cell_metrics: CellMetrics,
+) {
     buffer.set_wrap(font_system, Wrap::None);
     buffer.set_monospace_width(font_system, Some(cell_metrics.width as f32));
     buffer.set_size(
@@ -1466,7 +1495,6 @@ fn new_text_buffer(font_system: &mut FontSystem, cell_metrics: CellMetrics) -> B
         Some(cell_metrics.width as f32 * 2.0),
         Some(cell_metrics.height as f32),
     );
-    buffer
 }
 
 struct PreparedTextArea {

@@ -107,6 +107,8 @@ struct Application {
     focused: bool,
     cursor_blink_visible: bool,
     cursor_blink_dirty: bool,
+    surface_resize_dirty: bool,
+    pending_terminal_resize: Option<PhysicalSize<u32>>,
     ime_cursor_area_active: bool,
     last_cursor_blink: Instant,
     last_config_check: Instant,
@@ -128,6 +130,8 @@ impl Application {
             focused: true,
             cursor_blink_visible: true,
             cursor_blink_dirty: false,
+            surface_resize_dirty: false,
+            pending_terminal_resize: None,
             ime_cursor_area_active: false,
             last_cursor_blink: Instant::now(),
             last_config_check: Instant::now(),
@@ -228,7 +232,18 @@ impl Application {
         }
     }
 
-    fn resize_terminal(&mut self, width: u32, height: u32) {
+    fn queue_terminal_resize(&mut self, size: PhysicalSize<u32>) {
+        self.pending_terminal_resize = Some(size);
+    }
+
+    fn apply_pending_terminal_resize(&mut self) -> bool {
+        let Some(size) = self.pending_terminal_resize.take() else {
+            return false;
+        };
+        self.resize_terminal(size.width, size.height)
+    }
+
+    fn resize_terminal(&mut self, width: u32, height: u32) -> bool {
         let metrics = self
             .window_state
             .as_ref()
@@ -239,6 +254,10 @@ impl Application {
         let usable_height = window.usable_height(height);
         let cols = metrics.cols_for_width(usable_width);
         let rows = metrics.rows_for_height(usable_height);
+        if self.input.size() == (cols, rows) {
+            return false;
+        }
+
         self.input.resize(cols, rows);
 
         if let Some(pty) = &mut self.pty {
@@ -249,6 +268,7 @@ impl Application {
                 usable_height,
             ));
         }
+        true
     }
 
     fn cursor_cell_for_position(&self, position: PhysicalPosition<f64>) -> Option<(usize, usize)> {
@@ -462,18 +482,27 @@ impl ApplicationHandler<UserEvent> for Application {
                 self.request_redraw();
             }
             WindowEvent::Resized(size) => {
-                self.resize_terminal(size.width, size.height);
-                self.input.refresh_hover_hyperlink();
+                self.queue_terminal_resize(size);
+                let renderer_resized = if let Some(state) = &mut self.window_state {
+                    state.renderer.resize(size.width, size.height)
+                } else {
+                    false
+                };
+                if renderer_resized {
+                    self.surface_resize_dirty = true;
+                }
                 if let Some(state) = &mut self.window_state {
-                    state.renderer.resize(size.width, size.height);
                     state.window.request_redraw();
                 }
-                self.update_ime_cursor_area_from_current_snapshot();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.update_ime_cursor_area_from_current_snapshot();
             }
             WindowEvent::RedrawRequested => {
+                let terminal_resized = self.apply_pending_terminal_resize();
+                if terminal_resized {
+                    self.input.refresh_hover_hyperlink();
+                }
                 let snapshot = self.input.snapshot();
                 let inline_images = self.input.inline_images_for_snapshot(&snapshot);
                 self.update_ime_cursor_area(&snapshot);
@@ -483,8 +512,9 @@ impl ApplicationHandler<UserEvent> for Application {
                 let (search_matches, current_search_match) =
                     self.input.search_matches_for_snapshot(&snapshot);
                 let blink_dirty = self.cursor_blink_dirty;
+                let resize_dirty = self.surface_resize_dirty || terminal_resized;
                 let mut damage = self.input.take_render_damage();
-                if matches!(damage, Damage::None) && !blink_dirty {
+                if matches!(damage, Damage::None) && !blink_dirty && !resize_dirty {
                     return;
                 }
                 if matches!(damage, Damage::None) {
@@ -508,6 +538,7 @@ impl ApplicationHandler<UserEvent> for Application {
                     ) {
                         Ok(()) => {
                             self.cursor_blink_dirty = false;
+                            self.surface_resize_dirty = false;
                         }
                         Err(RenderError::SurfaceLost) => {
                             if state

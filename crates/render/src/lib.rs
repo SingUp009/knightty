@@ -1268,10 +1268,22 @@ impl Renderer {
                 &mut self.font_system,
                 (!segment.cell_span).then_some(self.cell_metrics.width as f32),
             );
+            buffer.set_wrap(
+                &mut self.font_system,
+                if segment.cell_span {
+                    Wrap::WordOrGlyph
+                } else {
+                    Wrap::None
+                },
+            );
             buffer.set_size(
                 &mut self.font_system,
                 Some(segment.width as f32),
-                Some(segment.height as f32),
+                if segment.cell_span {
+                    None
+                } else {
+                    Some(segment.height as f32)
+                },
             );
             buffer.set_text(
                 &mut self.font_system,
@@ -1281,15 +1293,17 @@ impl Renderer {
                 None,
             );
             let (left, top, scale, bounds) = if segment.cell_span {
-                let glyph_advance = buffer.layout_runs().next().map_or(0.0, |run| run.line_w);
+                let metrics = cell_span_text_metrics(buffer);
                 if let Some(scale) = cell_span_scale(
-                    glyph_advance,
+                    metrics.max_advance,
+                    metrics.line_count,
                     segment.width as f32,
                     segment.height as f32,
                     self.cell_metrics.line_height,
                 ) {
-                    let scaled_width = glyph_advance * scale;
-                    let scaled_height = self.cell_metrics.line_height * scale;
+                    let scaled_width = metrics.max_advance * scale;
+                    let scaled_height =
+                        self.cell_metrics.line_height * metrics.line_count as f32 * scale;
                     (
                         segment.x as f32 + (segment.width as f32 - scaled_width) * 0.5,
                         segment.y as f32 + (segment.height as f32 - scaled_height) * 0.5,
@@ -1348,8 +1362,29 @@ impl Renderer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CellSpanTextMetrics {
+    max_advance: f32,
+    line_count: usize,
+}
+
+fn cell_span_text_metrics(buffer: &Buffer) -> CellSpanTextMetrics {
+    let mut max_advance = 0.0f32;
+    let mut line_count = 0usize;
+    for run in buffer.layout_runs() {
+        line_count += 1;
+        max_advance = max_advance.max(run.line_w);
+    }
+
+    CellSpanTextMetrics {
+        max_advance,
+        line_count,
+    }
+}
+
 fn cell_span_scale(
     glyph_advance: f32,
+    line_count: usize,
     span_width: f32,
     span_height: f32,
     line_height: f32,
@@ -1358,10 +1393,15 @@ fn cell_span_scale(
         || !line_height.is_finite()
         || glyph_advance <= 0.0
         || line_height <= 0.0
+        || line_count == 0
     {
         return None;
     }
-    let scale = (span_width / glyph_advance).min(span_height / line_height);
+    let text_height = line_height * line_count as f32;
+    if !text_height.is_finite() || text_height <= 0.0 {
+        return None;
+    }
+    let scale = (span_width / glyph_advance).min(span_height / text_height);
     scale.is_finite().then_some(scale.max(0.0))
 }
 
@@ -4058,10 +4098,35 @@ mod tests {
 
     #[test]
     fn cell_span_scale_uses_glyph_advance_instead_of_cell_occupancy() {
-        assert_eq!(cell_span_scale(10.0, 30.0, 100.0, 20.0), Some(3.0));
-        assert_eq!(cell_span_scale(15.0, 30.0, 100.0, 20.0), Some(2.0));
-        assert_eq!(cell_span_scale(10.0, 30.0, 40.0, 20.0), Some(2.0));
-        assert_eq!(cell_span_scale(0.0, 30.0, 40.0, 20.0), None);
+        assert_eq!(cell_span_scale(10.0, 1, 30.0, 100.0, 20.0), Some(3.0));
+        assert_eq!(cell_span_scale(15.0, 1, 30.0, 100.0, 20.0), Some(2.0));
+        assert_eq!(cell_span_scale(10.0, 1, 30.0, 40.0, 20.0), Some(2.0));
+        assert_eq!(cell_span_scale(0.0, 1, 30.0, 40.0, 20.0), None);
+    }
+
+    #[test]
+    fn cell_span_scale_accounts_for_wrapped_line_count() {
+        assert_eq!(cell_span_scale(10.0, 2, 30.0, 40.0, 20.0), Some(1.0));
+        assert_eq!(cell_span_scale(10.0, 0, 30.0, 40.0, 20.0), None);
+    }
+
+    #[test]
+    fn render_plan_emits_one_wrapped_text_segment_for_multiple_grapheme_cell_span() {
+        let mut terminal = Terminal::new(8, 4);
+        terminal.place_cell_span("AB界", 3, 2).unwrap();
+        let metrics = CellMetrics::default();
+
+        let plan = build_render_plan(&terminal.snapshot(), &Damage::Full, metrics);
+        let spans = plan
+            .text
+            .iter()
+            .filter(|segment| segment.cell_span)
+            .collect::<Vec<_>>();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "AB界");
+        assert_eq!(spans[0].width, metrics.width * 3);
+        assert_eq!(spans[0].height, metrics.height * 2);
     }
 
     #[test]

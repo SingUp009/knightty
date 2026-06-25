@@ -37,7 +37,7 @@ function Write-CellSpan {
 }
 
 [Console]::Out.Write("${esc}[2J${esc}[H")
-Write-At -Row 1 -Column 1 -Text "Knightty Cell Span smoke test (minimum grid: 40x18)"
+Write-At -Row 1 -Column 1 -Text "Knightty Cell Span smoke test (minimum grid: 40x24)"
 
 Write-At -Row 3 -Column 1 -Text "ASCII 4x2"
 Write-CellSpan -Row 3 -Column 18 -Columns 4 -Rows 2 -Text "A"
@@ -54,4 +54,10 @@ Write-CellSpan -Row 13 -Column 18 -Columns 6 -Rows 3 -Text "👨‍💻"
 Write-At -Row 17 -Column 1 -Text "Wide rectangle 10x1"
 Write-CellSpan -Row 17 -Column 22 -Columns 10 -Rows 1 -Text "W"
 
-[Console]::Out.Write("${esc}[18;1H")
+Write-At -Row 19 -Column 1 -Text "Multi grapheme 3x2"
+Write-CellSpan -Row 19 -Column 22 -Columns 3 -Rows 2 -Text "AB界"
+
+Write-At -Row 22 -Column 1 -Text "Wrapped text 6x2"
+Write-CellSpan -Row 22 -Column 22 -Columns 6 -Rows 2 -Text "Span文字" -UseBel
+
+[Console]::Out.Write("${esc}[24;1H")

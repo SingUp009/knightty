@@ -23,6 +23,7 @@ use alacritty_terminal::vte::ansi::{
     Color as AlacrittyColor, Handler, NamedColor, Processor, Rgb as AlacrittyRgb,
 };
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// GUI-independent terminal state wrapper.
@@ -56,7 +57,6 @@ struct CellSpanState {
     columns: u16,
     rows: u16,
     text: String,
-    terminal_width: usize,
     render_cell: Cell,
     hyperlink: Option<Hyperlink>,
     template: AlacrittyCell,
@@ -227,7 +227,7 @@ pub struct ImagePlacement {
     pub z_index: ImageZIndex,
 }
 
-/// One Unicode grapheme rendered inside a rectangular logical-cell span.
+/// Text rendered inside a rectangular logical-cell span.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CellSpanPlacement {
     pub anchor: GridPoint,
@@ -241,13 +241,13 @@ pub struct CellSpanPlacement {
 pub enum CellSpanError {
     #[error("cell span text is empty")]
     EmptyText,
-    #[error("cell span text is wider than one terminal glyph")]
+    #[error("cell span text does not fit inside the requested cell span")]
     TextTooWide,
     #[error("cell span dimensions are zero")]
     ZeroDimension,
     #[error("cell span dimensions exceed the current terminal grid")]
     ExceedsGrid,
-    #[error("cell span is narrower than the grapheme's terminal width")]
+    #[error("cell span is narrower than at least one grapheme's terminal width")]
     TooNarrow,
 }
 
@@ -400,7 +400,7 @@ impl Terminal {
         &self.image_placements
     }
 
-    /// Place one Unicode grapheme inside a rectangular cell span.
+    /// Place text inside a rectangular cell span.
     pub fn place_cell_span(
         &mut self,
         text: &str,
@@ -413,13 +413,7 @@ impl Terminal {
         if text.is_empty() {
             return Err(CellSpanError::EmptyText);
         }
-        let terminal_width = UnicodeWidthStr::width(text);
-        if terminal_width > 2 {
-            return Err(CellSpanError::TextTooWide);
-        }
-        if usize::from(columns) < terminal_width {
-            return Err(CellSpanError::TooNarrow);
-        }
+        let metrics = validate_cell_span_text(text, columns, rows)?;
 
         let (grid_columns, grid_rows) = self.size();
         if usize::from(columns) > grid_columns || usize::from(rows) > grid_rows {
@@ -466,12 +460,11 @@ impl Terminal {
         let marker = self.allocate_cell_span_marker();
         let template = self.term.grid().cursor.template.clone();
         let hyperlink = template.hyperlink().and_then(hyperlink_from_alacritty);
-        let first = text.chars().next().ok_or(CellSpanError::EmptyText)?;
         let mut render_source = template.clone();
-        render_source.c = first;
+        render_source.c = metrics.first_char;
         let mut render_cell = Cell::from_alacritty(&render_source);
-        render_cell.ch = first;
-        render_cell.flags.wide = terminal_width == 2;
+        render_cell.ch = metrics.first_char;
+        render_cell.flags.wide = metrics.first_width == 2;
         render_cell.flags.wide_spacer = false;
 
         {
@@ -502,7 +495,6 @@ impl Terminal {
             columns,
             rows,
             text: text.to_owned(),
-            terminal_width,
             render_cell,
             hyperlink,
             template,
@@ -673,25 +665,86 @@ impl Terminal {
             {
                 continue;
             }
-            let mut cell = span.template.clone();
-            let mut chars = span.text.chars();
-            let Some(first) = chars.next() else {
-                continue;
+            self.write_cell_span_text_to_active_grid(&span, anchor);
+        }
+    }
+
+    fn write_cell_span_text_to_active_grid(&mut self, span: &CellSpanState, anchor: GridPoint) {
+        let columns = self.term.grid().columns();
+        if columns == 0 || anchor.col >= columns {
+            return;
+        }
+        let wrap_columns = usize::from(span.columns).min(columns - anchor.col);
+        if wrap_columns == 0 {
+            return;
+        }
+        let max_rows = usize::from(span.rows);
+
+        let mut col_offset = 0usize;
+        let mut row_offset = 0usize;
+        for grapheme in span.text.graphemes(true) {
+            let occupied = cell_span_occupied_width(grapheme);
+            if occupied > wrap_columns {
+                return;
+            }
+            if col_offset != 0 && col_offset.saturating_add(occupied) > wrap_columns {
+                row_offset = row_offset.saturating_add(1);
+                col_offset = 0;
+            }
+            if row_offset >= max_rows {
+                return;
+            }
+
+            let row = anchor.row.saturating_add(row_offset as isize);
+            let col = anchor.col.saturating_add(col_offset);
+            let Some(line) = line_for_row(row) else {
+                return;
             };
-            cell.c = first;
-            for ch in chars {
-                cell.push_zerowidth(ch);
+            if line < self.term.grid().topmost_line()
+                || line.0 >= i32::try_from(self.term.grid().screen_lines()).unwrap_or(i32::MAX)
+            {
+                return;
             }
-            if span.terminal_width == 2 {
-                cell.flags.insert(AlacrittyFlags::WIDE_CHAR);
-            }
-            let bg = cell.bg;
-            self.term.grid_mut()[line][Column(anchor.col)] = cell;
-            if span.terminal_width == 2 && anchor.col + 1 < self.term.grid().columns() {
-                let mut spacer = AlacrittyCell::from(bg);
-                spacer.flags.insert(AlacrittyFlags::WIDE_CHAR_SPACER);
-                self.term.grid_mut()[line][Column(anchor.col + 1)] = spacer;
-            }
+
+            self.write_cell_span_grapheme_to_active_grid(span, line, col, grapheme);
+            col_offset = col_offset.saturating_add(occupied);
+        }
+    }
+
+    fn write_cell_span_grapheme_to_active_grid(
+        &mut self,
+        span: &CellSpanState,
+        line: Line,
+        col: usize,
+        grapheme: &str,
+    ) {
+        let mut chars = grapheme.chars();
+        let Some(first) = chars.next() else {
+            return;
+        };
+
+        let mut cell = span.template.clone();
+        cell.c = first;
+        cell.extra = None;
+        cell.flags.remove(
+            AlacrittyFlags::WIDE_CHAR
+                | AlacrittyFlags::WIDE_CHAR_SPACER
+                | AlacrittyFlags::LEADING_WIDE_CHAR_SPACER
+                | AlacrittyFlags::WRAPLINE,
+        );
+        for ch in chars {
+            cell.push_zerowidth(ch);
+        }
+        let width = UnicodeWidthStr::width(grapheme);
+        if width == 2 {
+            cell.flags.insert(AlacrittyFlags::WIDE_CHAR);
+        }
+        let bg = cell.bg;
+        self.term.grid_mut()[line][Column(col)] = cell;
+        if width == 2 && col + 1 < self.term.grid().columns() {
+            let mut spacer = AlacrittyCell::from(bg);
+            spacer.flags.insert(AlacrittyFlags::WIDE_CHAR_SPACER);
+            self.term.grid_mut()[line][Column(col + 1)] = spacer;
         }
     }
 
@@ -1636,6 +1689,56 @@ const MAX_COMPAT_CSI_LEN: usize = 64;
 const MAX_WINDOW_TITLE_CHARS: usize = 1024;
 const MAX_HYPERLINK_URI_BYTES: usize = 2048;
 const MAX_HYPERLINK_ID_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellSpanTextMetrics {
+    first_char: char,
+    first_width: usize,
+}
+
+fn validate_cell_span_text(
+    text: &str,
+    columns: u16,
+    rows: u16,
+) -> Result<CellSpanTextMetrics, CellSpanError> {
+    let columns = usize::from(columns);
+    let rows = usize::from(rows);
+    let mut first = None;
+    let mut used_rows = 1usize;
+    let mut col = 0usize;
+
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if first.is_none() {
+            first = grapheme
+                .chars()
+                .next()
+                .map(|first_char| CellSpanTextMetrics {
+                    first_char,
+                    first_width: grapheme_width,
+                });
+        }
+
+        let occupied = grapheme_width.max(1);
+        if occupied > columns {
+            return Err(CellSpanError::TooNarrow);
+        }
+        if col != 0 && col.saturating_add(occupied) > columns {
+            used_rows = used_rows.saturating_add(1);
+            col = 0;
+        }
+        if used_rows > rows {
+            return Err(CellSpanError::TextTooWide);
+        }
+        col = col.saturating_add(occupied);
+    }
+
+    first.ok_or(CellSpanError::EmptyText)
+}
+
+fn cell_span_occupied_width(grapheme: &str) -> usize {
+    UnicodeWidthStr::width(grapheme).max(1)
+}
 
 fn cell_rects_intersect(
     left_anchor: GridPoint,
@@ -3790,6 +3893,35 @@ mod tests {
     }
 
     #[test]
+    fn multiple_grapheme_cell_span_uses_one_atomic_placement() {
+        let mut term = Terminal::new(8, 3);
+
+        term.place_cell_span("AB界", 4, 2).unwrap();
+
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.cell_spans.len(), 1);
+        assert_eq!(snapshot.cell_spans[0].text, "AB界");
+        assert_eq!(snapshot.cursor.x, 0);
+        assert_eq!(snapshot.cursor.y, 0);
+        assert_eq!(snapshot.cell(0, 0).ch, 'A');
+        assert_eq!(snapshot.cell(1, 0).ch, ' ');
+    }
+
+    #[test]
+    fn multiple_grapheme_cell_span_rejects_text_that_cannot_wrap_into_rows() {
+        let mut term = Terminal::new(8, 3);
+
+        assert_eq!(
+            term.place_cell_span("ABC", 2, 1),
+            Err(CellSpanError::TextTooWide)
+        );
+        assert_eq!(
+            term.place_cell_span("界", 1, 2),
+            Err(CellSpanError::TooNarrow)
+        );
+    }
+
+    #[test]
     fn writing_inside_cell_span_removes_the_entire_placement_atomically() {
         let mut term = Terminal::new(8, 3);
         term.place_cell_span("A", 3, 2).unwrap();
@@ -3921,6 +4053,21 @@ mod tests {
         assert!(snapshot.cell_spans.is_empty());
         assert_eq!(snapshot.cell(0, 0).ch, '界');
         assert!(snapshot.cell(1, 0).flags.wide_spacer);
+    }
+
+    #[test]
+    fn resizing_releases_multiple_grapheme_cell_span_as_normal_text() {
+        let mut term = Terminal::new(8, 3);
+        term.place_cell_span("AB界", 3, 2).unwrap();
+
+        term.resize(10, 4);
+
+        let snapshot = term.snapshot();
+        assert!(snapshot.cell_spans.is_empty());
+        assert_eq!(snapshot.cell(0, 0).ch, 'A');
+        assert_eq!(snapshot.cell(1, 0).ch, 'B');
+        assert_eq!(snapshot.cell(0, 1).ch, '界');
+        assert!(snapshot.cell(1, 1).flags.wide_spacer);
     }
 
     #[test]

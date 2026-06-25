@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "thiserror 2.0.18",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]

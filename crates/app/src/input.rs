@@ -2295,11 +2295,26 @@ mod harness_tests {
     }
 
     #[test]
+    fn multiple_grapheme_cell_span_osc_is_parsed_as_one_placement() {
+        let mut app = AppHarness::new();
+
+        app.feed("\x1b]7777;knightty;span=3x2:AB界\x07".as_bytes());
+
+        let snapshot = app.router.snapshot();
+        assert_eq!(snapshot.cell_spans.len(), 1);
+        assert_eq!(snapshot.cell_spans[0].text, "AB界");
+        assert_eq!(snapshot.cell_spans[0].columns, 3);
+        assert_eq!(snapshot.cell_spans[0].rows, 2);
+        assert_eq!(snapshot.cell(0, 0).ch, 'A');
+        assert_eq!(snapshot.cell(1, 0).ch, ' ');
+    }
+
+    #[test]
     fn invalid_cell_span_osc_does_not_change_grid_or_cursor() {
         let mut app = AppHarness::new();
         let before = app.router.snapshot();
 
-        app.feed(b"\x1b]7777;knightty;span=2x2:AB\x07");
+        app.feed(b"\x1b]7777;knightty;span=2x1:ABC\x07");
 
         let after = app.router.snapshot();
         assert!(after.cell_spans.is_empty());
@@ -2316,6 +2331,17 @@ mod harness_tests {
         app.copy_shortcut();
 
         assert_eq!(app.clipboard(), "e\u{301}");
+    }
+
+    #[test]
+    fn selecting_any_cell_in_multiple_grapheme_cell_span_copies_text_once() {
+        let mut app = AppHarness::new();
+        app.feed("\x1b]7777;knightty;span=3x2:AB界\x07".as_bytes());
+
+        app.left_drag((2, 1), (1, 1));
+        app.copy_shortcut();
+
+        assert_eq!(app.clipboard(), "AB界");
     }
 
     #[test]

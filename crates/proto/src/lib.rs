@@ -5,7 +5,7 @@ pub mod cell_span {
 
     pub const OSC_PREFIX: &[u8] = b"7777;knightty;";
 
-    /// One Knightty cell-span command parsed from an OSC 7777 payload.
+    /// One Knightty cell-span text command parsed from an OSC 7777 payload.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct CellSpanCommand<'a> {
         pub columns: u16,
@@ -18,8 +18,8 @@ pub mod cell_span {
     /// ```
     /// use knightty_proto::cell_span::parse_cell_span;
     ///
-    /// let command = parse_cell_span("span=3x2:界").unwrap();
-    /// assert_eq!((command.columns, command.rows, command.text), (3, 2, "界"));
+    /// let command = parse_cell_span("span=3x2:AB界").unwrap();
+    /// assert_eq!((command.columns, command.rows, command.text), (3, 2, "AB界"));
     /// ```
     pub fn parse_cell_span(payload: &str) -> Result<CellSpanCommand<'_>, CellSpanParseError> {
         let (dimensions, text) = payload
@@ -38,9 +38,8 @@ pub mod cell_span {
             return Err(CellSpanParseError::ControlCharacter);
         }
 
-        let mut graphemes = text.graphemes(true);
-        if graphemes.next().is_none() || graphemes.next().is_some() {
-            return Err(CellSpanParseError::MultipleGraphemes);
+        if text.graphemes(true).next().is_none() {
+            return Err(CellSpanParseError::MissingText);
         }
 
         Ok(CellSpanCommand {
@@ -67,7 +66,6 @@ pub mod cell_span {
         InvalidDimension,
         MissingText,
         ControlCharacter,
-        MultipleGraphemes,
     }
 
     #[cfg(test)]
@@ -93,11 +91,11 @@ pub mod cell_span {
         }
 
         #[test]
-        fn multiple_graphemes_are_rejected() {
-            assert_eq!(
-                parse_cell_span("span=2x2:AB"),
-                Err(CellSpanParseError::MultipleGraphemes)
-            );
+        fn multiple_graphemes_are_accepted() {
+            let command = parse_cell_span("span=4x2:AB界").unwrap();
+            assert_eq!(command.columns, 4);
+            assert_eq!(command.rows, 2);
+            assert_eq!(command.text, "AB界");
         }
 
         #[test]
